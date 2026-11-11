@@ -118,11 +118,11 @@ def read_vlq(data: bytes, index: int) -> tuple[int, int]:
 
 def parse_track(
     data: bytes,
-) -> tuple[list[tuple[int, int]], list[tuple[int, int]], list[tuple[int, int, int]], int, str]:
+) -> tuple[list[tuple[int, int, int, int]], list[tuple[int, int]], list[tuple[int, int, int]], int, str]:
     index = 0
     tick = 0
     running = None
-    notes: list[tuple[int, int]] = []
+    notes: list[tuple[int, int, int, int]] = []
     tempos: list[tuple[int, int]] = []
     signatures: list[tuple[int, int, int]] = []
     end_tick = 0
@@ -182,10 +182,11 @@ def parse_track(
             if kind in (0xC0, 0xD0):
                 index += 1
             elif kind in (0x80, 0x90, 0xA0, 0xB0, 0xE0):
+                note = data[index]
                 velocity = data[index + 1]
                 index += 2
                 if kind == 0x90 and velocity > 0:
-                    notes.append((tick, status & 0x0F))
+                    notes.append((tick, status & 0x0F, note, velocity))
             else:
                 raise ValueError(f"unsupported status {status:#x} at tick {tick}")
 
@@ -220,13 +221,15 @@ def parse_midi(path: Path) -> dict:
         signatures.extend(track_sigs)
         end_tick = max(end_tick, track_end)
 
-    drum_ticks = drum_note_ticks(tracks)
+    drum_events = kit_events(tracks)
+    drum_ticks = [tick for tick, _note, _velocity in drum_events]
     if drum_ticks:
         end_tick = max(drum_ticks) + 1
 
     return {
         "ppq": ppq,
         "notes": drum_ticks,
+        "events": drum_events,
         "tempos": tempos,
         "signatures": signatures,
         "end_tick": end_tick,
@@ -240,7 +243,7 @@ def is_kit_track(name: str) -> bool:
     return "drum" in text
 
 
-def drum_note_ticks(tracks: list[dict]) -> list[int]:
+def kit_events(tracks: list[dict]) -> list[tuple[int, int, int]]:
     """Hits from the kit track, or channel 10 when the file has no kit track.
 
     These MIDIs are full arrangements. Guitar and bass notes are not the
@@ -248,13 +251,54 @@ def drum_note_ticks(tracks: list[dict]) -> list[int]:
     stays out of the kit so acoustic sections read as empty.
     """
     kit_tracks = [track for track in tracks if is_kit_track(track["name"])]
-    if kit_tracks:
-        return [tick for track in kit_tracks for tick, _channel in track["notes"]]
-    return [tick for track in tracks for tick, channel in track["notes"] if channel == 9]
+    source = kit_tracks if kit_tracks else tracks
+    events = []
+    for track in source:
+        for tick, channel, note, velocity in track["notes"]:
+            if kit_tracks or channel == 9:
+                events.append((tick, note, velocity))
+    events.sort()
+    return events
 
 
-def build_measures(midi: dict) -> tuple[list[int], list[tuple[int, int, int]]]:
-    """Return hit counts per measure and each meter change as (bar, num, den)."""
+def tick_to_ms(tempos: list[tuple[int, int]], ppq: int):
+    """Return a function that converts a tick to milliseconds using the tempo map."""
+    ordered = sorted((tick, us) for tick, us in tempos if us > 0)
+    points: list[tuple[int, int]] = []
+    for tick, us in ordered:
+        if points and points[-1][0] == tick:
+            points[-1] = (tick, us)
+        else:
+            points.append((tick, us))
+    if not points or points[0][0] > 0:
+        first = points[0][1] if points else 500_000
+        points = [(0, first)] + [item for item in points if item[0] > 0]
+    anchors: list[tuple[int, int, float]] = []
+    seconds = 0.0
+    last_tick = 0
+    microseconds = points[0][1]
+    for tick, new_us in points:
+        if tick > last_tick:
+            seconds += (tick - last_tick) * microseconds / ppq / 1_000_000
+        anchors.append((tick, new_us, seconds))
+        last_tick = tick
+        microseconds = new_us
+
+    def convert(tick: int) -> int:
+        chosen = anchors[0]
+        for anchor in anchors:
+            if anchor[0] <= tick:
+                chosen = anchor
+            else:
+                break
+        at, micro, base = chosen
+        return round((base + (tick - at) * micro / ppq / 1_000_000) * 1000)
+
+    return convert
+
+
+def build_measures(midi: dict) -> tuple[list[int], list[tuple[int, int, int]], list[int]]:
+    """Return hit counts, meter changes, and the tick at the start of every bar plus the end tick."""
     ppq = midi["ppq"]
     signatures = sorted(midi["signatures"])
     if not signatures or signatures[0][0] != 0:
@@ -271,6 +315,7 @@ def build_measures(midi: dict) -> tuple[list[int], list[tuple[int, int, int]]]:
 
     hits: list[int] = []
     meters: list[tuple[int, int, int]] = []
+    boundaries = [0]
     tick = 0
     sig_index = 0
     numerator, denominator = collapsed[0][1], collapsed[0][2]
@@ -295,8 +340,11 @@ def build_measures(midi: dict) -> tuple[list[int], list[tuple[int, int, int]]]:
             note_index += 1
         hits.append(count)
         tick = bar_end
+        boundaries.append(tick)
 
-    return hits, meters
+    if not hits:
+        boundaries = [0, 0]
+    return hits, meters, boundaries
 
 
 def tempo_text(tempos: list[tuple[int, int]]) -> str:
@@ -539,8 +587,26 @@ def render_chart(song: dict, hits: list[int], roles: list[str]) -> str:
             f'font-size="11" font-family="Segoe UI, sans-serif"{weight}>{bar}</text>'
         )
 
+    parts.append(
+        f'<g class="playhead" data-pad="{pad_l}" data-step="{step}" visibility="hidden" pointer-events="none">'
+        f'<rect class="playhead-shade" y="{plot_top}" width="{step}" height="{plot_h}" fill="#1c1915" opacity="0.16"/>'
+        f'<line class="playhead-line" y1="{plot_top - 8}" y2="{plot_bottom}" stroke="#d23b2a" stroke-width="2"/>'
+        f'<polygon class="playhead-cap" data-y="{plot_top - 16}" points="-7,0 7,0 0,9" fill="#d23b2a" transform="translate(0 {plot_top - 16})"/>'
+        f"</g>"
+    )
     parts.append("</svg>")
     return "".join(parts)
+
+
+LOOP_KEYS = {"pattern1", "pattern1Fill", "pattern2", "pattern2Fill"}
+
+
+def play_button(song_id: str, label: str, start: int, end: int, loop: bool, text: str = "Play") -> str:
+    return (
+        f'<button type="button" class="play" data-song="{attr(song_id)}" '
+        f'data-start="{start}" data-end="{end}" data-loop="{1 if loop else 0}" '
+        f'data-label="{attr(label)}">{escape(text)}</button>'
+    )
 
 
 def typing_rows(song: dict) -> str:
@@ -557,6 +623,7 @@ def typing_rows(song: dict) -> str:
             extra = f'<div class="range">bars {start}–{end}</div>'
         rows.append(
             "<tr>"
+            f"<td>{play_button(song['id'], label, start, end, key in LOOP_KEYS)}</td>"
             f'<td class="name"><span class="swatch {swatch_class}"></span>{escape(label)}</td>'
             f'<td class="num">{start}</td>'
             f'<td class="num">{length}</td>'
@@ -566,10 +633,22 @@ def typing_rows(song: dict) -> str:
     return "\n".join(rows)
 
 
+def playback_json(midi: dict, boundaries: list[int]) -> str:
+    convert = tick_to_ms(midi["tempos"], midi["ppq"])
+    payload = {
+        "bars": [convert(tick) for tick in boundaries],
+        "events": [
+            [convert(tick), note, velocity]
+            for tick, note, velocity in midi["events"]
+        ],
+    }
+    return json.dumps(payload, separators=(",", ":"))
+
+
 def render_song(song: dict, midi_path: Path) -> str:
     check_expected(song)
     midi = parse_midi(midi_path)
-    hits, meters = build_measures(midi)
+    hits, meters, boundaries = build_measures(midi)
     last_needed = max(span[1] for span in song["divisions"].values())
     flag = ""
     if len(hits) < last_needed:
@@ -590,27 +669,34 @@ def render_song(song: dict, midi_path: Path) -> str:
         f"meter={meter_text(meters)} maxHits={max(hits) if hits else 0} "
         f"first8={hits[:8]}"
     )
-    return f"""
+    article = f"""
 <article id="{attr(song["id"])}">
   <h2>{escape(song["artist"])} — {escape(song["title"])}</h2>
   <p class="meta">{meta}</p>
   {flag}
+  <div class="transport">
+    {play_button(song["id"], "the drum track", 1, len(hits), False, "Play drums")}
+    <button type="button" class="stop">Stop</button>
+    <span class="status" data-status-for="{attr(song["id"])}"></span>
+  </div>
   <div class="chart-scroll">
     {render_chart(song, hits, roles)}
   </div>
-  <p class="caption">Column height is hits on the drum kit. Gray measures are not stored on the pedal. A black outline and a triangle mark a one-bar fill.</p>
+  <p class="caption">Column height is hits on the drum kit. Play uses those kit notes only. Patterns and fills repeat until you stop them. Intro, ending, and the whole track play once.</p>
   <table class="sheet">
     <caption>Type these into Rhythm Converter</caption>
     <thead>
-      <tr><th>Division</th><th>Start measure</th><th>Length</th><th>File bars</th></tr>
+      <tr><th>Listen</th><th>Division</th><th>Start measure</th><th>Length</th><th>File bars</th></tr>
     </thead>
     <tbody>
       {typing_rows(song)}
     </tbody>
   </table>
   {note_block}
+  <script type="application/json" class="drum-data" data-song="{attr(song["id"])}">DRUM_JSON</script>
 </article>
 """
+    return article.replace("DRUM_JSON", playback_json(midi, boundaries))
 
 
 def render_page(catalog: dict, songs_html: str) -> str:
@@ -742,6 +828,19 @@ def render_page(catalog: dict, songs_html: str) -> str:
       font-variant-numeric: tabular-nums;
       width: 8.5rem;
     }}
+    .transport {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 0 0 12px; }}
+    .transport .status {{ color: var(--muted); font-size: 0.92rem; }}
+    button.play, button.stop {{
+      font: inherit;
+      border: 0;
+      border-radius: 999px;
+      padding: 6px 12px;
+      cursor: pointer;
+    }}
+    button.play {{ background: #1c1915; color: #fffdf8; }}
+    button.play[aria-pressed="true"] {{ background: var(--intro); }}
+    button.stop {{ background: transparent; color: var(--ink); border: 1px solid var(--line); }}
+    tr.is-playing {{ background: #f6f1e6; }}
     .range {{ color: var(--muted); font-size: 0.9rem; }}
     .notes {{ margin: 0 0 12px; padding-left: 18px; }}
     .excluded h2 {{ font-size: 1.25rem; margin-bottom: 8px; }}
@@ -752,7 +851,7 @@ def render_page(catalog: dict, songs_html: str) -> str:
 <body>
   <header class="page">
     <h1>RC-10R section charts</h1>
-    <p class="lede">Open the MIDI in Rhythm Converter, delete the user pattern already in that memory, then type the start measure and length for each division. Fills are one bar and can sit inside another division. Ranges are the file’s own measures, starting at 1.</p>
+    <p class="lede">Open the MIDI in Rhythm Converter, delete the user pattern already in that memory, then type the start measure and length for each division. Play a division or the whole file to hear the drum kit on its own. Fills are one bar and can sit inside another division. Ranges are the file’s own measures, starting at 1.</p>
     <nav>{nav}</nav>
     <ul class="legend">
       <li><span class="swatch intro"></span>Intro</li>
@@ -773,6 +872,7 @@ def render_page(catalog: dict, songs_html: str) -> str:
       {excluded}
     </ul>
   </section>
+  <script src="player.js?v=2"></script>
 </body>
 </html>
 """
