@@ -1,0 +1,176 @@
+{
+  "drumRoot": "C:\\Users\\irsfr\\OneDrive\\Desktop\\MidiTool\\Drum Tracks\\Artists",
+  "songs": [
+    {
+      "id": "thunderstruck",
+      "title": "Thunderstruck",
+      "artist": "AC/DC",
+      "file": "ACDC/AC_DC_-_Thunderstruck.mid",
+      "divisions": {
+        "intro": [1, 91],
+        "pattern1": [92, 103],
+        "pattern1Fill": [84, 84],
+        "pattern2": [142, 157],
+        "pattern2Fill": [157, 157],
+        "ending": [158, 162]
+      },
+      "notes": [
+        "The ending is the outro, including the slow-down. Leave that ritard in the ending."
+      ]
+    },
+    {
+      "id": "panama",
+      "title": "Panama",
+      "artist": "Van Halen",
+      "file": "Van Halen/Van_Halen_-_Panama.mid",
+      "divisions": {
+        "intro": [1, 42],
+        "pattern1": [43, 50],
+        "pattern1Fill": [41, 41],
+        "pattern2": [83, 102],
+        "pattern2Fill": [120, 120],
+        "ending": [120, 124]
+      },
+      "notes": [
+        "Pattern 2 fill is bar 120, which is also the first bar of the ending."
+      ]
+    },
+    {
+      "id": "good-times-bad-times",
+      "title": "Good Times Bad Times",
+      "artist": "Led Zeppelin",
+      "file": "Led Zeppelin/Led_Zeppelin_-_Good_Times_Bad_Times.mid",
+      "divisions": {
+        "intro": [1, 17],
+        "pattern1": [18, 22],
+        "pattern1Fill": [17, 17],
+        "pattern2": [23, 30],
+        "pattern2Fill": [67, 67],
+        "ending": [49, 68]
+      },
+      "notes": [
+        "Pattern 2 is the bridge, bars 23–30. The solo at bars 36–43 is the unused alternate.",
+        "The file is about 91 BPM. The published chart is 95. The file stays loud through bar 68."
+      ]
+    },
+    {
+      "id": "aint-talkin-bout-love",
+      "title": "Ain't Talkin' 'Bout Love",
+      "artist": "Van Halen",
+      "file": "Van Halen/Van_Halen_-_Ain't_Talkin_Bout_Love.mid",
+      "divisions": {
+        "intro": [1, 24],
+        "pattern1": [25, 32],
+        "pattern1Fill": [26, 26],
+        "pattern2": [65, 80],
+        "pattern2Fill": [124, 124],
+        "ending": [121, 131]
+      },
+      "notes": [
+        "This file has many tempo changes. Set one tempo near 139 in Rhythm Converter before you assign. This chart does not rewrite the file.",
+        "Pattern 1 fill is bar 26, inside Pattern 1."
+      ]
+    },
+    {
+      "id": "communication-breakdown",
+      "title": "Communication Breakdown",
+      "artist": "Led Zeppelin",
+      "file": "Led Zeppelin/Led_Zeppelin_-_Communication_Breakdown.mid",
+      "divisions": {
+        "intro": [1, 24],
+        "pattern1": [25, 36],
+        "pattern1Fill": [24, 24],
+        "pattern2": [63, 76],
+        "pattern2Fill": [112, 112],
+        "ending": [89, 116]
+      },
+      "notes": [
+        "Intro and the first chorus match the chart. Later sections can sit a few bars off."
+      ]
+    },
+    {
+      "id": "ego-brain",
+      "title": "Ego Brain",
+      "artist": "System of a Down",
+      "file": "Sytem of a Down/System of a Down — Ego Brain [MIDIfind.com].mid",
+      "divisions": {
+        "intro": [1, 18],
+        "pattern1": [19, 26],
+        "pattern1Fill": [18, 18],
+        "pattern2": [45, 54],
+        "pattern2Fill": [66, 66],
+        "ending": [67, 67]
+      },
+      "notes": [
+        "One column is one 12/8 measure. The file ending is bar 67. The chart outro is bars 67–72, and this file stops at 67."
+      ]
+    },
+    {
+      "id": "why-dont-you-get-a-job",
+      "title": "Why Don't You Get a Job",
+      "artist": "The Offspring",
+      "file": "The Offspring/The_Offspring_-_Why_Dont'You_Get_a_Job.mid",
+      "divisions": {
+        "intro": [1, 17],
+        "pattern1": [18, 73],
+        "pattern1Fill": [17, 17],
+        "pattern2": [18, 73],
+        "pattern2Fill": [73, 73],
+        "ending": [74, 74]
+      },
+      "notes": [
+        "Pattern 2 uses the same measures as Pattern 1. The drums do not change after the intro."
+      ]
+    },
+    {
+      "id": "ramble-on",
+      "title": "Ramble On",
+      "artist": "Led Zeppelin",
+      "file": "Led Zeppelin/Led_Zeppelin_-_Ramble_On.mid",
+      "divisions": {
+        "intro": [1, 29],
+        "pattern1": [30, 37],
+        "pattern1Fill": [63, 63],
+        "pattern2": [86, 98],
+        "pattern2Fill": [98, 98],
+        "ending": [99, 107]
+      },
+      "notes": [
+        "Pattern 1 fill is bar 63, inside a later chorus that is not stored on the pedal. It is not next to Pattern 1.",
+        "Silent bars are the acoustic sections, including the intro."
+      ]
+    }
+  ],
+  "excluded": [
+    {
+      "title": "Back in Black",
+      "artist": "AC/DC",
+      "reason": "The file is one groove, a silent stretch, then the same groove. It has no chorus, bridge, or outro."
+    },
+    {
+      "title": "Whole Lotta Love",
+      "artist": "Led Zeppelin",
+      "reason": "The file is 86 bars and the chart is 126. The long middle was cut."
+    },
+    {
+      "title": "ATWA",
+      "artist": "System of a Down",
+      "reason": "The file is 32 bars at about half speed against a 65-bar chart."
+    },
+    {
+      "title": "Americana",
+      "artist": "The Offspring",
+      "reason": "The file is the full song in half time, 60 bars against 119 chart bars."
+    },
+    {
+      "title": "Heartbreaker",
+      "artist": "Led Zeppelin",
+      "reason": "The meter changes and the tempo drifts, so a 4/4 bar count lands on the wrong music."
+    },
+    {
+      "title": "Vicinity of Obscenity",
+      "artist": "System of a Down",
+      "reason": "The meter changes, so a straight bar count does not match the song."
+    }
+  ]
+}
