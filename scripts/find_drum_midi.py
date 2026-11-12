@@ -1342,6 +1342,7 @@ class Finder:
         self.chart.on_bars_chosen = self.on_bars_chosen
         self.chart.on_bars_inserted = self.on_bars_inserted
         self.chart.on_deselect = self.clear_selection
+        self.chart.on_bar_double = self.on_bar_double
         self.chart.grid(row=3, column=0, sticky="nsew", pady=(0, 6))
 
         lower = ttk.Frame(right)
@@ -1699,7 +1700,9 @@ class Finder:
         view = self.view
         if view is None:
             return
-        self.chart.draw(view["hits"], view["divisions"], self.chart_parts(), view["lanes"], view["crashes"], view["meters"])
+        self.chart.draw(
+            view["hits"], view["divisions"], self.chart_parts(), view["lanes"], view["crashes"], view["meters"], view["bar_ms"]
+        )
         self.refresh_zoom()
 
     def sync_entries(self) -> None:
@@ -2145,6 +2148,17 @@ class Finder:
             return
         self.apply_selection(bar, bar)
 
+    def on_bar_double(self, bar: int) -> None:
+        """Play from the double-clicked bar, or loop the selection there when Loop is on."""
+        if not self.view:
+            return
+        self.on_bar_click(bar)
+        if self.loop_on.get() and self.selection:
+            start, end = self.selection
+            self.start_playback(start, self.span_label(start, end), (start, end))
+        else:
+            self.start_playback(bar, "the drum track", None)
+
     def on_loop_toggle(self) -> None:
         if self._selecting or self._loading or not self.view:
             return
@@ -2422,8 +2436,10 @@ class Finder:
             self.playing["pedal"] = True
             self.playing["segment"] = (view["bar_ms"][start - 1], view["bar_ms"][end])
             self.playing["bar"] = start - 1
+            self.playing["bars_done"] = 0
         else:
             self.pedal.reset()
+            self.pedal.set_clock(None)
         self.tick_playhead()
         self.refresh_transport()
         self.update_pedal_display()
@@ -2472,10 +2488,16 @@ class Finder:
         upcoming = None
         crossed = seg_end
         if position >= seg_end:
+            last = bar_index(bar_ms, seg_end - 1)
+            state["bars_done"] += last - state["bar"] + 1
+            self.pedal.set_clock(float(state["bars_done"]))
             upcoming = self.pedal.range_done()
-        elif index != state["bar"] and self.pedal.pending:
-            crossed = bar_ms[index]
-            upcoming = self.pedal.bar_done()
+        elif index != state["bar"]:
+            state["bars_done"] += index - state["bar"]
+            if self.pedal.pending:
+                crossed = bar_ms[index]
+                self.pedal.set_clock(float(state["bars_done"]))
+                upcoming = self.pedal.bar_done()
         state["bar"] = index
         if upcoming is not None:
             late = max(0.0, position - crossed)
@@ -2497,9 +2519,23 @@ class Finder:
             state["bar"] = start - 1
             state["label"] = dict(chart.DIVISION_ORDER)[upcoming]
             position = target
+        self.pedal_clock(position)
         self.show_at(position, "Pedal:", state["label"])
         self.update_pedal_display(position)
         self.after_id = self.root.after(10, self.tick_playhead)
+
+    def pedal_clock(self, position: float) -> None:
+        """Tell the looper how many bars the pedal has played, fractions included."""
+        state = self.playing
+        if not (state and state.get("pedal")) or not self.view:
+            self.pedal.set_clock(None)
+            return
+        bar_ms = self.view["bar_ms"]
+        index = state["bar"]
+        start, end = bar_ms[index], bar_ms[index + 1]
+        length = max(1.0, end - start)
+        part = min(0.999, max(0.0, (position - start) / length))
+        self.pedal.set_clock(state["bars_done"] + part, length)
 
     def open_pedal(self) -> None:
         if not self.view:
@@ -2554,6 +2590,9 @@ class Finder:
                 return
         self.stop()
         self.pedal.divisions = self.view["divisions"]
+        bar_ms = self.view["bar_ms"]
+        opening = self.pedal.span("intro" if self.pedal.has_intro() else "pattern1")[0]
+        self.pedal.set_clock(0.0, bar_ms[opening] - bar_ms[opening - 1])
         first = self.pedal.start()
         start, _end = self.pedal.span(first)
         self.pending_pedal = True
@@ -2564,6 +2603,8 @@ class Finder:
     def pedal_press(self, name: str) -> None:
         if self.pending_pedal:
             return
+        if self.playing and self.playing.get("pedal") and not self.playing.get("paused"):
+            self.pedal_clock(self.playhead_ms())
         result = getattr(self.pedal, name)()
         if result == "start":
             self.pedal_start()
@@ -2579,7 +2620,7 @@ class Finder:
 
     def pedal_clear(self) -> None:
         self.pedal.clear_tracks()
-        self.pedal.note = "LOOPS CLEARED"
+        self.pedal.note = "PHRASE CLEARED"
         self.update_pedal_display(self.playhead_ms() if self.playing else None)
 
     def pedal_stop(self) -> None:
@@ -2598,35 +2639,40 @@ class Finder:
             "state": state,
             "pending": pedal.pending,
             "loop": pedal.loop,
+            "track": pedal.track,
+            "recorded": pedal.tracks[pedal.track],
+            "note": pedal.note,
             "sync": pedal.sync,
             "range": self.pedal_ranges(),
             "waiting": pedal.waiting_text(),
+            "guide": pedal.loop_guide(),
+            "loop_progress": pedal.loop_progress(),
+            "cue": pedal.press_now(),
             "beats": 4,
             "beat": 0,
-            "progress": 0.0,
         }
         bar_ms = self.view["bar_ms"] if self.view else []
         if state == "idle" or not self.view or position is None:
             if self.pending_pedal and self.preparing:
                 info["waiting"] = "Preparing the drums…"
             bpm = None
+            meter = "4/4"
             if self.view and len(bar_ms) > 1:
                 first = self.view["divisions"]["intro"][0] if self.view.get("divisions") else 1
                 bpm = self.bar_bpm(max(0, first - 1))
-            info["lines"] = pedal.lcd_lines(None, None, bpm)
+                meter = "{}/{}".format(*self.bar_meter(max(0, first - 1)))
+            info["lines"] = pedal.lcd_lines(None, None, bpm, meter)
             window.show(info)
             return
         start, end = pedal.span(state)
         index = bar_index(bar_ms, position)
-        beats, _den = self.bar_meter(index)
+        beats, den = self.bar_meter(index)
         bar_start, bar_end = bar_ms[index], bar_ms[index + 1]
         beat = int((position - bar_start) / max(1.0, bar_end - bar_start) * beats) + 1
-        range_start, range_end = bar_ms[start - 1], bar_ms[end]
         info.update(
             beats=beats,
             beat=min(beats, max(1, beat)),
-            progress=min(1.0, max(0.0, (position - range_start) / max(1.0, range_end - range_start))),
-            lines=pedal.lcd_lines(index + 1 - start + 1, min(beats, max(1, beat)), self.bar_bpm(index)),
+            lines=pedal.lcd_lines(index + 1 - start + 1, min(beats, max(1, beat)), self.bar_bpm(index), f"{beats}/{den}"),
             range=f"Now: {dict(chart.DIVISION_ORDER)[state]}, bars {start}–{end}.   {self.pedal_ranges()}",
         )
         window.show(info)
@@ -3321,7 +3367,7 @@ class Finder:
             "Chart and keyboard tips",
             "Chart\n"
             "• On the bars or the section names above them: click to pick a bar, drag to select bars, right-drag to add silent bars.\n"
-            "• Play or Space starts from the selected bar.\n"
+            "• Play or Space starts from the selected bar. Double-click a bar to play from it.\n"
             "• Below the bars: click to clear the selection, drag to pan.\n"
             "• Mouse wheel over the chart pans left and right. Shift + wheel zooms at the pointer.\n\n"
             "Keys\n"
@@ -3626,6 +3672,7 @@ class Finder:
         winsound.PlaySound(None, winsound.SND_PURGE)
         self.chart.hide_playhead()
         self.pedal.reset()
+        self.pedal.set_clock(None)
         self.update_pedal_display()
         if drop_audio:
             self.rendered_generation = None

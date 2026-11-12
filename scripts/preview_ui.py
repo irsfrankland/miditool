@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import array
+import bisect
 import io
 import math
 import random
 import sys
+import time
 import wave
 
 import tkinter as tk
@@ -37,6 +39,11 @@ GRID_BEAT = "#232833"
 GRID_PULSE = "#20242e"
 GRID_METER = "#6b5a3a"
 GRID_METER_TEXT = "#d9b56e"
+TIP_BG = "#2b1f24"
+RULER_BG = "#252a34"
+RULER_TICK = "#7d8494"
+RULER_TEXT = "#d6d9e0"
+RULER_STEPS_S = (5, 10, 15, 30, 60, 120, 300)
 RATE = 16000
 LANES = (
     ("K", "Kick", {35, 36}, "#e2694a"),
@@ -48,7 +55,7 @@ CRASHES = {49, 52, 55, 57}
 LANE_HEIGHT = 10
 LANE_GAP = 3
 PLOT_MIN = 72
-PLOT_MAX = 220
+FOLLOW_AGAIN_S = 1.5
 
 
 def bar_lanes(events: list, boundaries: list[int]) -> tuple[list[tuple[int, ...]], set[int]]:
@@ -59,10 +66,10 @@ def bar_lanes(events: list, boundaries: list[int]) -> tuple[list[tuple[int, ...]
     if count == 0:
         return [], crashes
     index = 0
-    for time, note, _velocity in sorted(events, key=lambda item: item[0]):
-        while index < count - 1 and time >= boundaries[index + 1]:
+    for at, note, _velocity in sorted(events, key=lambda item: item[0]):
+        while index < count - 1 and at >= boundaries[index + 1]:
             index += 1
-        if time < boundaries[0] or time >= boundaries[-1]:
+        if at < boundaries[0] or at >= boundaries[-1]:
             continue
         for lane, (_short, _name, notes, _color) in enumerate(LANES):
             if note in notes:
@@ -91,7 +98,7 @@ class SectionChart(ttk.Frame):
             highlightthickness=0,
             xscrollcommand=self._on_scroll,
         )
-        self.bar = ttk.Scrollbar(self, orient="horizontal", command=self.canvas.xview, style="Dark.Horizontal.TScrollbar")
+        self.bar = ttk.Scrollbar(self, orient="horizontal", command=self._on_scrollbar, style="Dark.Horizontal.TScrollbar")
         self.canvas.configure(xscrollcommand=self.bar.set)
         self.canvas.pack(fill="both", expand=True)
         self.bar.pack(fill="x", pady=(4, 0))
@@ -106,17 +113,23 @@ class SectionChart(ttk.Frame):
         self.shade = None
         self.head = None
         self.seen = False
+        self.following = True
+        self._moved_at = 0.0
         self._hits: list[int] = []
         self._divisions: dict = {}
         self._parts: list[tuple[int, int, str]] = []
         self._lanes: list[tuple[int, ...]] = []
         self._crashes: set[int] = set()
         self._meters: list[tuple[int, int]] = []
+        self._times: list[float] = []
+        self.ruler_top = 0
+        self.mark = None
         self.on_zoom_changed = None
         self.on_bar_click = None
         self.on_bars_chosen = None
         self.on_bars_inserted = None
         self.on_deselect = None
+        self.on_bar_double = None
         self._selection: tuple[int, int] | None = None
         self._press_bar: int | None = None
         self._press_x = 0
@@ -130,6 +143,8 @@ class SectionChart(ttk.Frame):
         self._painted: list[int] = []
         self._grid_bg: int | None = None
         self.pick: int | None = None
+        self.tip_bg: int | None = None
+        self.tip_text: int | None = None
         self.canvas.configure(cursor="hand2", takefocus=True)
         self.canvas.bind("<Motion>", self._on_hover)
         self.canvas.bind("<Leave>", lambda _event: self._hide_pick())
@@ -137,6 +152,7 @@ class SectionChart(ttk.Frame):
         self.canvas.bind("<Shift-MouseWheel>", self._on_zoom_wheel)
         self.canvas.bind("<Control-MouseWheel>", self._on_zoom_wheel)
         self.canvas.bind("<ButtonPress-1>", self._press)
+        self.canvas.bind("<Double-Button-1>", self._double)
         self.canvas.bind("<B1-Motion>", self._motion)
         self.canvas.bind("<ButtonRelease-1>", self._release)
         self.canvas.bind("<ButtonPress-3>", self._insert_press)
@@ -163,7 +179,17 @@ class SectionChart(ttk.Frame):
         self.lane_height = max(7, round(LANE_HEIGHT * scale))
         self._redraw()
 
+    def _fit_region(self, width: int | None = None) -> None:
+        """Center the chart sideways when the whole song is narrower than the window."""
+        width = self.full_width if width is None else width
+        spare = max(0, self.canvas.winfo_width() - width)
+        left = -(spare // 2)
+        self.canvas.configure(scrollregion=(left, 0, left + width + spare, self._content))
+        if spare:
+            self.canvas.xview_moveto(0)
+
     def _on_resize(self, event: tk.Event) -> None:
+        self._fit_region()
         if self._hits and abs(event.height - self._drawn_height) > 3:
             if self._redraw_job is not None:
                 self.after_cancel(self._redraw_job)
@@ -173,7 +199,7 @@ class SectionChart(ttk.Frame):
         self._redraw_job = None
         if self._hits:
             fraction = self.canvas.canvasx(0) / max(1, self.full_width)
-            self.draw(self._hits, self._divisions, self._parts, self._lanes, self._crashes, self._meters)
+            self.draw(self._hits, self._divisions, self._parts, self._lanes, self._crashes, self._meters, self._times)
             self.canvas.xview_moveto(fraction)
 
     def _on_scroll(self, first: str, last: str) -> None:
@@ -192,17 +218,28 @@ class SectionChart(ttk.Frame):
         bar_pos = (self.canvas.canvasx(anchor) - self.pad) / self.step
         self.zoom_index += direction
         self.step = self.steps[self.zoom_index]
-        self.draw(self._hits, self._divisions, self._parts, self._lanes, self._crashes, self._meters)
+        self.draw(self._hits, self._divisions, self._parts, self._lanes, self._crashes, self._meters, self._times)
         left = self.pad + bar_pos * self.step - anchor
         self.canvas.xview_moveto(max(0.0, left / max(1, self.full_width)))
         if self.on_zoom_changed is not None:
             self.on_zoom_changed()
 
+    def _user_moved(self) -> None:
+        """The view was moved by hand, so the playhead stops pulling it back."""
+        self.following = False
+        self._moved_at = time.perf_counter()
+
+    def _on_scrollbar(self, *args: str) -> None:
+        self._user_moved()
+        self.canvas.xview(*args)
+
     def _on_zoom_wheel(self, event: tk.Event) -> str:
+        self._user_moved()
         self.zoom(1 if event.delta > 0 else -1, event.x)
         return "break"
 
     def _on_pan_wheel(self, event: tk.Event) -> str:
+        self._user_moved()
         self.canvas.xview_scroll(-3 if event.delta > 0 else 3, "units")
         return "break"
 
@@ -290,8 +327,7 @@ class SectionChart(ttk.Frame):
         )
         label = "+1 silent bar" if count == 1 else f"+{count} silent bars"
         self.canvas.create_text(x0 + 4, self.plot_top + 6, text=label, anchor="nw", fill=INK, font=self.bar_font, tags="insert")
-        width = max(self.full_width, x1 + 16)
-        self.canvas.configure(scrollregion=(0, 0, width, self._content))
+        self._fit_region(max(self.full_width, x1 + 16))
         self._raise_playhead()
 
     def _press(self, event: tk.Event) -> None:
@@ -308,10 +344,20 @@ class SectionChart(ttk.Frame):
         self._press_x = event.x
         self._dragged = False
 
+    def _double(self, event: tk.Event) -> None:
+        """Double-click on a selectable bar plays from it; elsewhere it is an ordinary press."""
+        if not self._hits or not self.in_plot(event):
+            self._press(event)
+            return
+        self._press_bar = None
+        if self.on_bar_double is not None:
+            self.on_bar_double(self.bar_at(event))
+
     def _motion(self, event: tk.Event) -> None:
         if self._panning:
             if abs(event.x - self._press_x) > 4:
                 self._dragged = True
+            self._user_moved()
             self.canvas.scan_dragto(event.x, 0, gain=1)
             return
         if self._press_bar is None:
@@ -393,10 +439,36 @@ class SectionChart(ttk.Frame):
         self.canvas.coords(self.pick, x, y, x, self.plot_bottom)
         self.canvas.itemconfigure(self.pick, state="normal")
         self.canvas.tag_raise(self.pick)
+        self._show_tip(bar, x, self.canvas.canvasy(event.y))
+
+    def _show_tip(self, bar: int, x: float, y: float) -> None:
+        """A label beside the pick line naming the bar a click would select."""
+        if self._press_bar is not None and self._press_bar != bar:
+            start, end = sorted((self._press_bar, bar))
+            text = f"Bars {start}–{end} · {end - start + 1} bars"
+        else:
+            text = f"Bar {bar}"
+        if len(self._times) > bar and text.startswith("Bar "):
+            minutes, seconds = divmod(int(self._times[bar - 1] // 1000), 60)
+            text += f"  {minutes}:{seconds:02d}"
+        pad_x, pad_y = 6, 3
+        width = self.axis_bold.measure(text) + 2 * pad_x
+        height = self.axis_bold.metrics("linespace") + 2 * pad_y
+        view_right = self.canvas.canvasx(self.canvas.winfo_width())
+        left = x + 10 if x + 10 + width <= view_right - 4 else x - 10 - width
+        top = min(max(y - height - 6, 2), self.plot_bottom - height - 2)
+        self.canvas.coords(self.tip_bg, left, top, left + width, top + height)
+        self.canvas.coords(self.tip_text, left + pad_x, top + height / 2)
+        self.canvas.itemconfigure(self.tip_text, text=text)
+        for item in (self.tip_bg, self.tip_text):
+            self.canvas.itemconfigure(item, state="normal")
+            self.canvas.tag_raise(item)
 
     def _hide_pick(self) -> None:
         if self.pick is not None:
             self.canvas.itemconfigure(self.pick, state="hidden")
+            self.canvas.itemconfigure(self.tip_bg, state="hidden")
+            self.canvas.itemconfigure(self.tip_text, state="hidden")
 
     def reveal(self, bar: int) -> None:
         if not self._hits or not 1 <= bar <= len(self._hits):
@@ -440,7 +512,9 @@ class SectionChart(ttk.Frame):
         lanes: list[tuple[int, ...]] | None = None,
         crashes: set[int] | None = None,
         meters: list[tuple[int, int]] | None = None,
+        times: list[float] | None = None,
     ) -> None:
+        """times: when each bar starts in ms, plus the song's end, for the time ruler."""
         chosen = self._selection
         self._bar_items = []
         self._painted = []
@@ -450,6 +524,7 @@ class SectionChart(ttk.Frame):
         self._lanes = list(lanes or [])
         self._crashes = set(crashes or ())
         self._meters = [tuple(meter) for meter in meters or []]
+        self._times = [float(at) for at in times or []]
         roles = chart.paint_roles(len(hits), divisions)
         names = dict(chart.DIVISION_ORDER)
         self.canvas.delete("all")
@@ -527,23 +602,28 @@ class SectionChart(ttk.Frame):
         first_row = round(name_h * 0.7)
         part_bottom = first_row + max(part_rows, 1) * part_stride
         rc_top = part_bottom + 2
-        meter_row = rc_top + max(rc_rows, 1) * rc_stride + 4
+        ruler_h = axis_h + 9 if len(self._times) > len(hits) else 0
+        self.ruler_top = rc_top + max(rc_rows, 1) * rc_stride + 2
+        meter_row = self.ruler_top + ruler_h + (4 if ruler_h else 2)
         self.plot_top = meter_row + meter_h - 1
         lane_rows = len(LANES) if self._lanes else 0
         lane_step = self.lane_height + LANE_GAP
         below = 5 + lane_rows * lane_step + 6 + max(axis_rows, 1) * axis_stride + 8
         room = self.canvas.winfo_height()
-        plot_h = max(PLOT_MIN, min(PLOT_MAX, room - self.plot_top - below)) if room > 50 else PLOT_MIN
+        plot_h = max(PLOT_MIN, room - self.plot_top - below) if room > 50 else PLOT_MIN
         self._drawn_height = room
         self.plot_bottom = self.plot_top + plot_h
         lane_top = self.plot_bottom + 5
         axis_top = lane_top + lane_rows * lane_step + 6
         content = axis_top + max(axis_rows, 1) * axis_stride + 8
         self._content = content
-        self.canvas.configure(height=self.plot_top + PLOT_MIN + below, scrollregion=(0, 0, self.full_width, content))
+        self.canvas.configure(height=self.plot_top + PLOT_MIN + below)
+        self._fit_region()
         self._base = round(plot_h * 0.15)
         self._span = plot_h - self._base - max(18, round(plot_h * 0.2))
         self._draw_grid(len(hits), peak, meter_row)
+        if ruler_h:
+            self._draw_ruler(len(hits), self.ruler_top, ruler_h)
         peak_y = self.plot_bottom - self._base - self._span
         self.canvas.create_text(8, peak_y, text=str(peak), fill=MUTED, anchor="w", font=self.axis_font)
         self.canvas.create_line(self.pad, self.plot_bottom, self.full_width - 12, self.plot_bottom, fill="#3a404d")
@@ -595,9 +675,12 @@ class SectionChart(ttk.Frame):
             0, self.plot_top, self.step, self.plot_bottom, outline=PLAYHEAD, width=1, state="hidden"
         )
         self.head = self.canvas.create_line(
-            0, self.plot_top - 4, 0, self.plot_bottom, fill=PLAYHEAD, width=2, state="hidden"
+            0, self._head_top(), 0, self.plot_bottom, fill=PLAYHEAD, width=2, state="hidden"
         )
+        self.mark = self.canvas.create_polygon(0, 0, 0, 0, 0, 0, fill=PLAYHEAD, outline="", state="hidden") if ruler_h else None
         self.pick = self.canvas.create_line(0, self.plot_top, 0, self.plot_bottom, fill=PICK, width=1, state="hidden")
+        self.tip_bg = self.canvas.create_rectangle(0, 0, 0, 0, fill=TIP_BG, outline=PICK, state="hidden")
+        self.tip_text = self.canvas.create_text(0, 0, text="", fill=INK, anchor="w", font=self.axis_bold, state="hidden")
         if chosen:
             self.show_selection(*chosen)
 
@@ -657,6 +740,47 @@ class SectionChart(ttk.Frame):
                     )
         self.canvas.create_line(right, top, right, bottom, fill=GRID_PHRASE, tags="grid")
 
+    def _head_top(self) -> float:
+        return self.ruler_top if self.mark is not None else self.plot_top - 4
+
+    def x_at_ms(self, at: float) -> float:
+        """Chart x for a time in the song; inside a bar the time is spread evenly."""
+        times = self._times
+        index = max(0, min(len(times) - 2, bisect.bisect_right(times, at) - 1))
+        start, end = times[index], times[index + 1]
+        part = (at - start) / (end - start) if end > start else 0.0
+        return self.pad + (index + part) * self.step
+
+    def _draw_ruler(self, count: int, top: float, height: float) -> None:
+        """A seconds ruler like Audacity's: a tick each second, a labeled one every five."""
+        times = self._times[: count + 1]
+        left = self.pad - 1
+        right = self.pad + count * self.step - 1
+        bottom = top + height
+        self.canvas.create_rectangle(left, top, right, bottom, fill=RULER_BG, width=0, tags="ruler")
+        self.canvas.create_line(left, bottom, right, bottom, fill=RULER_TICK, tags="ruler")
+        first, last = times[0], times[-1]
+        if last <= first:
+            return
+        px_per_s = (right - left) / ((last - first) / 1000)
+        label_w = self.axis_font.measure("00:00") + 10
+        every = next((step for step in RULER_STEPS_S if step * px_per_s >= label_w), RULER_STEPS_S[-1])
+        minor = 1 if px_per_s >= 5 else 5
+        second = math.ceil(first / 1000 / minor) * minor
+        while second * 1000 <= last:
+            x = self.x_at_ms(second * 1000.0)
+            if second % every == 0:
+                self.canvas.create_line(x, top + 3, x, bottom, fill=RULER_TICK, tags="ruler")
+                minutes, rest = divmod(int(second), 60)
+                self.canvas.create_text(
+                    x + 3, top + 1, text=f"{minutes}:{rest:02d}", fill=RULER_TEXT, anchor="nw", font=self.axis_font, tags="ruler"
+                )
+            elif second % 5 == 0:
+                self.canvas.create_line(x, bottom - 7, x, bottom, fill=RULER_TICK, tags="ruler")
+            else:
+                self.canvas.create_line(x, bottom - 3, x, bottom, fill=RULER_TICK, tags="ruler")
+            second += minor
+
     def show_playhead(self, index: int, fraction: float) -> None:
         if self.head is None:
             return
@@ -664,23 +788,36 @@ class SectionChart(ttk.Frame):
         x0 = self.pad + index * self.step
         x = x0 + fraction * self.step
         self.canvas.coords(self.shade, x0, self.plot_top, x0 + self.step, self.plot_bottom)
-        self.canvas.coords(self.head, x, self.plot_top - 4, x, self.plot_bottom)
+        self.canvas.coords(self.head, x, self._head_top(), x, self.plot_bottom)
         self.canvas.itemconfigure(self.shade, state="normal")
         self.canvas.itemconfigure(self.head, state="normal")
         self.canvas.tag_raise(self.shade)
         self.canvas.tag_raise(self.head)
+        if self.mark is not None:
+            top, size = self.ruler_top, 6
+            self.canvas.coords(self.mark, x - size, top, x + size, top, x + size, top + size, x, top + 2 * size, x - size, top + size)
+            self.canvas.itemconfigure(self.mark, state="normal")
+            self.canvas.tag_raise(self.mark)
         width = max(1, self.canvas.winfo_width())
         left = self.canvas.canvasx(0)
+        if not self.following:
+            in_view = left + 40 <= x <= left + width - 40
+            if not (in_view and time.perf_counter() - self._moved_at > FOLLOW_AGAIN_S):
+                return
+            self.following = True
         if not self.seen or x < left + 40 or x > left + width - 40:
             self.canvas.xview_moveto(max(0.0, (x - width * 0.35) / max(1, self.full_width)))
             self.seen = True
 
     def hide_playhead(self) -> None:
         self.seen = False
+        self.following = True
         if self.head is None:
             return
         self.canvas.itemconfigure(self.shade, state="hidden")
         self.canvas.itemconfigure(self.head, state="hidden")
+        if self.mark is not None:
+            self.canvas.itemconfigure(self.mark, state="hidden")
 
 
 def _tone(mix: list[float], pos: int, length: int, freq: float, freq_end: float, peak: float) -> None:
