@@ -22,9 +22,56 @@ ROLE = {
 }
 CHART_BG = "#171a21"
 INK = "#f3f1eb"
-MUTED = "#9b978e"
+MUTED = "#c2beb4"
 PLAYHEAD = "#e24b3a"
+GRID_BG = "#1c2029"
+GRID_LEVEL = "#242a35"
+GRID_BAR = "#2a303c"
+GRID_PHRASE = "#3c4453"
+GRID_BEAT = "#232833"
+GRID_PULSE = "#20242e"
+GRID_METER = "#6b5a3a"
+GRID_METER_TEXT = "#d9b56e"
 RATE = 16000
+LANES = (
+    ("K", "Kick", {35, 36}, "#e2694a"),
+    ("S", "Snare", {37, 38, 39, 40}, "#f0d264"),
+    ("T", "Toms", {41, 43, 45, 47, 48, 50}, "#b38ce0"),
+    ("C", "Cymbals", {42, 44, 46, 49, 51, 52, 53, 55, 57, 59}, "#5ec4d6"),
+)
+CRASHES = {49, 52, 55, 57}
+LANE_HEIGHT = 10
+LANE_GAP = 3
+
+
+def bar_lanes(events: list, boundaries: list[int]) -> tuple[list[tuple[int, ...]], set[int]]:
+    """Hits per bar for kick, snare, toms, and cymbals, and the bars that have a crash."""
+    count = max(0, len(boundaries) - 1)
+    lanes = [[0] * len(LANES) for _ in range(count)]
+    crashes: set[int] = set()
+    if count == 0:
+        return [], crashes
+    index = 0
+    for time, note, _velocity in sorted(events, key=lambda item: item[0]):
+        while index < count - 1 and time >= boundaries[index + 1]:
+            index += 1
+        if time < boundaries[0] or time >= boundaries[-1]:
+            continue
+        for lane, (_short, _name, notes, _color) in enumerate(LANES):
+            if note in notes:
+                lanes[index][lane] += 1
+                break
+        if note in CRASHES:
+            crashes.add(index + 1)
+    return [tuple(row) for row in lanes], crashes
+
+
+def _blend(color: str, amount: float) -> str:
+    amount = max(0.0, min(1.0, amount))
+    base = [int(CHART_BG[i : i + 2], 16) for i in (1, 3, 5)]
+    top = [int(color[i : i + 2], 16) for i in (1, 3, 5)]
+    mixed = [round(b + (t - b) * amount) for b, t in zip(base, top)]
+    return "#" + "".join(f"{value:02x}" for value in mixed)
 
 
 class SectionChart(ttk.Frame):
@@ -55,6 +102,9 @@ class SectionChart(ttk.Frame):
         self._hits: list[int] = []
         self._divisions: dict = {}
         self._parts: list[tuple[int, int, str]] = []
+        self._lanes: list[tuple[int, ...]] = []
+        self._crashes: set[int] = set()
+        self._meters: list[tuple[int, int]] = []
         self.on_zoom_changed = None
         self.on_bar_click = None
         self.on_bars_chosen = None
@@ -75,10 +125,11 @@ class SectionChart(ttk.Frame):
         self.canvas.bind("<ButtonPress-3>", self._insert_press)
         self.canvas.bind("<B3-Motion>", self._insert_motion)
         self.canvas.bind("<ButtonRelease-3>", self._insert_release)
-        self.name_font = tkfont.Font(self.canvas, family="Segoe UI", size=9, weight="bold")
-        self.bar_font = tkfont.Font(self.canvas, family="Segoe UI", size=8)
-        self.axis_font = tkfont.Font(self.canvas, family="Segoe UI", size=8)
-        self.axis_bold = tkfont.Font(self.canvas, family="Segoe UI", size=8, weight="bold")
+        self.name_font = tkfont.Font(self.canvas, family="Segoe UI", size=11, weight="bold")
+        self.bar_font = tkfont.Font(self.canvas, family="Segoe UI", size=10)
+        self.axis_font = tkfont.Font(self.canvas, family="Segoe UI", size=10)
+        self.axis_bold = tkfont.Font(self.canvas, family="Segoe UI", size=10, weight="bold")
+        self.lane_font = tkfont.Font(self.canvas, family="Segoe UI", size=9, weight="bold")
 
     def _on_scroll(self, first: str, last: str) -> None:
         self.bar.set(first, last)
@@ -93,7 +144,7 @@ class SectionChart(ttk.Frame):
         fraction = self.canvas.canvasx(0) / max(1, self.full_width)
         self.zoom_index += direction
         self.step = self.steps[self.zoom_index]
-        self.draw(self._hits, self._divisions, self._parts)
+        self.draw(self._hits, self._divisions, self._parts, self._lanes, self._crashes, self._meters)
         self.canvas.xview_moveto(fraction)
         if self.on_zoom_changed is not None:
             self.on_zoom_changed()
@@ -264,11 +315,22 @@ class SectionChart(ttk.Frame):
             label["row"] = row
         return len(occupied)
 
-    def draw(self, hits: list[int], divisions: dict, parts: list[tuple[int, int, str]] | None = None) -> None:
+    def draw(
+        self,
+        hits: list[int],
+        divisions: dict,
+        parts: list[tuple[int, int, str]] | None = None,
+        lanes: list[tuple[int, ...]] | None = None,
+        crashes: set[int] | None = None,
+        meters: list[tuple[int, int]] | None = None,
+    ) -> None:
         chosen = self._selection
         self._hits = list(hits)
         self._divisions = divisions
         self._parts = list(parts or [])
+        self._lanes = list(lanes or [])
+        self._crashes = set(crashes or ())
+        self._meters = [tuple(meter) for meter in meters or []]
         roles = chart.paint_roles(len(hits), divisions)
         names = dict(chart.DIVISION_ORDER)
         self.canvas.delete("all")
@@ -336,34 +398,60 @@ class SectionChart(ttk.Frame):
         part_rows = self._assign_rows(part_labels)
         rc_rows = self._assign_rows(rc_labels)
         axis_rows = self._assign_rows(axis_labels)
-        part_stride = 32
-        rc_stride = 18
-        axis_stride = 14
-        part_bottom = 12 + max(part_rows, 1) * part_stride
+        part_stride = 42
+        rc_stride = 24
+        axis_stride = 20
+        part_bottom = 14 + max(part_rows, 1) * part_stride
         rc_top = part_bottom + 2
-        self.plot_top = rc_top + max(rc_rows, 1) * rc_stride + 8
+        meter_row = rc_top + max(rc_rows, 1) * rc_stride + 4
+        self.plot_top = meter_row + 16
         self.plot_bottom = self.plot_top + 120
-        axis_top = self.plot_bottom + 6
+        lane_top = self.plot_bottom + 5
+        lane_rows = len(LANES) if self._lanes else 0
+        axis_top = lane_top + lane_rows * (LANE_HEIGHT + LANE_GAP) + 6
         content = axis_top + max(axis_rows, 1) * axis_stride + 8
         self._content = content
         self.canvas.configure(height=max(248, content), scrollregion=(0, 0, self.full_width, content))
+        self._draw_grid(len(hits), peak, meter_row)
         self.canvas.create_text(8, self.plot_top + 4, text=str(peak), fill=MUTED, anchor="w", font=self.axis_font)
-        self.canvas.create_line(self.pad, self.plot_bottom, self.full_width - 12, self.plot_bottom, fill="#343844")
+        self.canvas.create_line(self.pad, self.plot_bottom, self.full_width - 12, self.plot_bottom, fill="#3a404d")
         for bar, count_hits in enumerate(hits, start=1):
             role = roles[bar - 1]
             column = 18 if count_hits == 0 else 18 + round(count_hits / peak * 94)
             x = self.pad + (bar - 1) * self.step
             y = self.plot_bottom - column
             self.canvas.create_rectangle(x, y, x + self.bar_w, self.plot_bottom, fill=ROLE[role], width=0)
+            if self.bar_w >= 12:
+                beats, _pulses = self.beats_in(*self.meter_of(bar))
+                divider = _blend(ROLE[role], 0.58)
+                for index in range(1, beats):
+                    bx = x + index * self.bar_w / beats
+                    self.canvas.create_line(bx, y + 2, bx, self.plot_bottom, fill=divider)
             if bar in fills:
                 self.canvas.create_rectangle(x, y, x + self.bar_w, self.plot_bottom, outline=INK, width=1)
+            if bar in self._crashes:
+                middle = x + self.bar_w / 2
+                radius = 2 if self.step < 16 else 3
+                self.canvas.create_oval(
+                    middle - radius, y - 4 - 2 * radius, middle + radius, y - 4, fill=INK, outline="", tags="crash"
+                )
+        if self._lanes:
+            peaks = [max((row[lane] for row in self._lanes), default=0) or 1 for lane in range(len(LANES))]
+            for lane, (short, _name, _notes, color) in enumerate(LANES):
+                top = lane_top + lane * (LANE_HEIGHT + LANE_GAP)
+                self.canvas.create_text(10, top + LANE_HEIGHT / 2, text=short, fill=color, anchor="w", font=self.lane_font)
+                for bar, row in enumerate(self._lanes[: len(hits)], start=1):
+                    value = row[lane]
+                    x = self.pad + (bar - 1) * self.step
+                    fill = _blend(color, 0.12) if value == 0 else _blend(color, 0.3 + 0.7 * value / peaks[lane])
+                    self.canvas.create_rectangle(x, top, x + self.bar_w, top + LANE_HEIGHT, fill=fill, width=0, tags="lane")
         for bar in section_starts:
             x = self.pad + (bar - 1) * self.step
             self.canvas.create_line(x, self.plot_top, x, self.plot_bottom, fill=INK, width=1)
         for label in part_labels:
-            y = 12 + label["row"] * part_stride
+            y = 14 + label["row"] * part_stride
             self.canvas.create_text(label["x"], y, text=label["text"], fill="#e6d3a8", anchor="w", font=self.name_font)
-            self.canvas.create_text(label["x"], y + 16, text=label["bar"], fill="#e6d3a8", anchor="w", font=self.bar_font)
+            self.canvas.create_text(label["x"], y + 20, text=label["bar"], fill="#d9c79d", anchor="w", font=self.bar_font)
         for label in rc_labels:
             y = rc_top + label["row"] * rc_stride
             self.canvas.create_text(label["x"], y, text=label["text"], fill=label["fill"], anchor="w", font=self.name_font)
@@ -378,6 +466,62 @@ class SectionChart(ttk.Frame):
         )
         if chosen:
             self.show_selection(*chosen)
+
+    def meter_of(self, bar: int) -> tuple[int, int]:
+        if 1 <= bar <= len(self._meters):
+            num, den = self._meters[bar - 1]
+            return int(num), int(den)
+        return 4, 4
+
+    @staticmethod
+    def beats_in(num: int, den: int) -> tuple[int, int]:
+        """Felt beats per bar and the pulses inside each beat (6/8 is two beats of three)."""
+        if den >= 8 and num % 3 == 0 and num > 3:
+            return num // 3, 3
+        return max(1, num), 1
+
+    def _draw_grid(self, count: int, peak: int, meter_row: int) -> None:
+        """Bar, beat, and phrase lines behind the bars, following each bar's time signature."""
+        left = self.pad - 1
+        right = self.pad + count * self.step - 1
+        top, bottom = self.plot_top, self.plot_bottom
+        self.canvas.create_rectangle(left, top, right, bottom, fill=GRID_BG, width=0, tags="grid")
+        for share in (0.25, 0.5, 0.75, 1.0):
+            y = bottom - (18 + share * 94)
+            self.canvas.create_line(left, y, right, y, fill=GRID_LEVEL, tags="grid")
+        beat_room = self.bar_w >= 12
+        phrase_start = 1
+        previous = None
+        label_end = -1e9
+        for bar in range(1, count + 1):
+            meter = self.meter_of(bar)
+            x = self.pad + (bar - 1) * self.step
+            if meter != previous:
+                phrase_start = bar
+                if previous is not None:
+                    self.canvas.create_line(x - 1, meter_row, x - 1, bottom, fill=GRID_METER, width=2, tags="grid")
+                text = f"{meter[0]}/{meter[1]}"
+                if x + 1 > label_end:
+                    self.canvas.create_text(
+                        x + 1, meter_row + 7, text=text, fill=GRID_METER_TEXT, anchor="w",
+                        font=self.axis_bold, tags="grid",
+                    )
+                    label_end = x + 1 + self.axis_bold.measure(text) + 6
+                previous = meter
+            elif (bar - phrase_start) % 4 == 0:
+                self.canvas.create_line(x - 1, top, x - 1, bottom, fill=GRID_PHRASE, width=1, tags="grid")
+            else:
+                self.canvas.create_line(x - 1, top, x - 1, bottom, fill=GRID_BAR, width=1, tags="grid")
+            if beat_room:
+                beats, pulses = self.beats_in(*meter)
+                divisions = beats * pulses if self.bar_w >= 30 and pulses > 1 else beats
+                for index in range(1, divisions):
+                    bx = x + index * self.bar_w / divisions
+                    on_beat = pulses == 1 or divisions == beats or index % pulses == 0
+                    self.canvas.create_line(
+                        bx, top, bx, bottom, fill=GRID_BEAT if on_beat else GRID_PULSE, tags="grid"
+                    )
+        self.canvas.create_line(right, top, right, bottom, fill=GRID_PHRASE, tags="grid")
 
     def show_playhead(self, index: int, fraction: float) -> None:
         if self.head is None:

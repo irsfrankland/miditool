@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Drum MIDI finder - Songsterr sync",
+  "version": "1.0.0",
+  "description": "Sends the Songsterr player's bar and play state to the Drum MIDI finder on this computer, so the drums play along.",
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.songsterr.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "host_permissions": ["http://127.0.0.1:47391/*"]
+}
