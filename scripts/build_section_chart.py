@@ -1,18 +1,40 @@
-"""Read drum MIDIs and the RC-10R song list in songs/ready.json.
+"""Read drum MIDIs and the RC-10R song list.
 
-The finder uses this module to parse MIDI files and count kit hits per bar.
-Run it directly to check the song list. The eight original songs have locked
-start × length values in EXPECTED. This module does not rewrite MIDI files.
+The song list belongs to each Windows user, in %APPDATA%\\MidiTool\\song-list.json,
+so it does not travel with the program. The finder uses this module to parse MIDI
+files and count kit hits per bar. Run it directly to check the song list. The eight
+original songs have locked start × length values in EXPECTED once they are in a
+user's list. This module does not rewrite MIDI files.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-MAP_PATH = ROOT / "songs" / "ready.json"
+MAP_PATH = Path(os.environ.get("APPDATA") or ROOT) / "MidiTool" / "song-list.json"
+OLD_MAP_PATH = ROOT / "songs" / "ready.json"
+BLANK_LIST = {"drumRoot": "../Drum Tracks/Artists", "songs": [], "excluded": []}
+
+
+def ensure_song_list() -> Path:
+    """Create this user's song list: a copy of a list left in the project folder, or a blank one."""
+    if not MAP_PATH.is_file():
+        MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if OLD_MAP_PATH.is_file():
+            shutil.copyfile(OLD_MAP_PATH, MAP_PATH)
+        else:
+            MAP_PATH.write_text(json.dumps(BLANK_LIST, indent=2) + "\n", encoding="utf-8")
+    return MAP_PATH
+
+
+def is_locked(song_id: str, catalog: dict) -> bool:
+    """An original song is locked only after it is in this user's list."""
+    return song_id in EXPECTED and any(song.get("id") == song_id for song in catalog.get("songs", []))
 
 DIVISION_ORDER = (
     ("intro", "Intro"),
@@ -26,7 +48,7 @@ DIVISION_ORDER = (
 STORED_KEYS = ("intro", "pattern1", "pattern2", "ending")
 
 # Start measure and length. Length is last bar - first bar + 1.
-# A mismatch with songs/ready.json fails the check.
+# A mismatch with the user's song list fails the check.
 EXPECTED = {
     "thunderstruck": {
         "intro": (1, 91),
@@ -459,7 +481,7 @@ def drum_root(catalog: dict) -> Path:
 
 def main() -> None:
     """Check the song list: every MIDI is there, and the eight original songs keep their ranges."""
-    catalog = json.loads(MAP_PATH.read_text(encoding="utf-8"))
+    catalog = json.loads(ensure_song_list().read_text(encoding="utf-8"))
     root = drum_root(catalog)
     for song in catalog["songs"]:
         path = root / song["file"]

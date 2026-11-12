@@ -688,12 +688,12 @@ def add_to_list(
     if not artist or not title:
         raise ValueError("Enter the artist and the song title.")
     slug = song_id(title)
-    if slug in chart.EXPECTED:
+    previous = catalog_path.read_bytes()
+    catalog = json.loads(previous.decode("utf-8"))
+    if chart.is_locked(slug, catalog):
         raise ValueError(
             f"{title} is already in the song list with fixed ranges. This finder will not replace it."
         )
-    previous = catalog_path.read_bytes()
-    catalog = json.loads(previous.decode("utf-8"))
     root = drum_root or chart.drum_root(catalog)
     notes = file_notes(src)
     relative, dest, created = place_midi(src, artist, root)
@@ -1442,7 +1442,7 @@ class Finder:
         self.status["text"] = text
 
     def reload_songs(self) -> None:
-        self.catalog = load_catalog(chart.MAP_PATH)
+        self.catalog = load_catalog(chart.ensure_song_list())
         self.songs = list(self.catalog["songs"])
         tree = self.saved_list
         children = tree.get_children("")
@@ -3449,7 +3449,7 @@ class Finder:
         chosen = self.settings.get("sourceFolder")
         if chosen:
             return Path(chosen)
-        return chart.drum_root(self.catalog or load_catalog(chart.MAP_PATH))
+        return chart.drum_root(self.catalog or load_catalog(chart.ensure_song_list()))
 
     def output_folder(self) -> Path:
         chosen = self.settings.get("finalFolder")
@@ -3812,7 +3812,7 @@ class Finder:
         preview.pack(anchor="w", pady=(12, 0))
 
         source = Path(view["path"])
-        locked = view.get("song_id") in chart.EXPECTED and view.get("bars_changed")
+        locked = chart.is_locked(view.get("song_id") or "", self.catalog or {}) and view.get("bars_changed")
         keep = tk.StringVar(value="keep")
         ttk.Label(frame, text="The original file", style="Section.TLabel").pack(anchor="w", pady=(16, 0))
         ttk.Label(frame, text=str(source), style="Muted.TLabel", wraplength=520, justify="left").pack(anchor="w")
