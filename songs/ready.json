@@ -112,14 +112,14 @@
       "file": "The Offspring/The_Offspring_-_Why_Dont'You_Get_a_Job.mid",
       "divisions": {
         "intro": [1, 17],
-        "pattern1": [18, 73],
+        "pattern1": [18, 32],
         "pattern1Fill": [17, 17],
-        "pattern2": [18, 73],
-        "pattern2Fill": [73, 73],
+        "pattern2": [33, 48],
+        "pattern2Fill": [48, 48],
         "ending": [74, 74]
       },
       "notes": [
-        "Pattern 2 uses the same measures as Pattern 1. The drums do not change after the intro."
+        "Pattern 1 is the chorus before the jingle bell. Pattern 2 is the jingle-bell chorus starting at bar 33. They are not the same bars."
       ]
     },
     {
@@ -139,6 +139,38 @@
         "Pattern 1 fill is bar 63, inside a later chorus that is not stored on the pedal. It is not next to Pattern 1.",
         "Silent bars are the acoustic sections, including the intro."
       ]
+    },
+    {
+      "id": "americana",
+      "title": "Americana",
+      "artist": "The Offspring",
+      "file": "The Offspring/Offspring (The) — Americana (3) [MIDIfind.com] (2).mid",
+      "divisions": {
+        "intro": [1, 27],
+        "pattern1": [28, 43],
+        "pattern1Fill": [27, 27],
+        "pattern2": [46, 53],
+        "pattern2Fill": [53, 53],
+        "ending": [54, 60]
+      },
+      "notes": [
+        "The meter changes, so a straight bar count can land on the wrong music. Pattern 2 is the break at bar 46 through the chorus after it, not the same bars as Pattern 1."
+      ]
+    },
+    {
+      "id": "sick-of-life",
+      "title": "Sick of Life",
+      "artist": "Godsmack",
+      "file": "Godsmack/Godsmack — Sick of Life [MIDIfind.com].mid",
+      "divisions": {
+        "intro": [1, 12],
+        "pattern1": [13, 28],
+        "pattern1Fill": [12, 12],
+        "pattern2": [57, 64],
+        "pattern2Fill": [64, 64],
+        "ending": [81, 83]
+      },
+      "notes": []
     }
   ],
   "excluded": [

@@ -1,0 +1,25 @@
+<article id="{{ID}}">
+  <h2>{{HEADING}}</h2>
+  <p class="meta">{{META}}</p>
+  {{FLAG}}
+  <div class="transport">
+    {{PLAY_DRUMS}}
+    <button type="button" class="stop">Stop</button>
+    <span class="status" data-status-for="{{ID}}"></span>
+  </div>
+  <div class="chart-scroll">
+    {{CHART}}
+  </div>
+  <p class="caption">Column height is hits on the drum kit. Play uses those kit notes only. Patterns and fills repeat until you stop them. Intro, ending, and the whole track play once.</p>
+  <table class="sheet">
+    <caption>Type these into Rhythm Converter</caption>
+    <thead>
+      <tr><th>Listen</th><th>Division</th><th>Start measure</th><th>Length</th><th>File bars</th></tr>
+    </thead>
+    <tbody>
+      {{ROWS}}
+    </tbody>
+  </table>
+  {{NOTES}}
+  <script type="application/json" class="drum-data" data-song="{{ID}}">{{DRUM_JSON}}</script>
+</article>

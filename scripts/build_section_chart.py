@@ -1,8 +1,16 @@
-"""Build a labeled measure chart for the eight ready RC-10R songs.
+"""Build labeled measure charts for the RC-10R songs in songs/ready.json.
 
-Reads songs/ready.json and the drum MIDIs it names, counts kit hits per file
-measure, and writes docs/charts/index.html. Ranges are taken from the map.
-This script does not rewrite MIDI files.
+The page is assembled from templates, then written to docs/charts/index.html:
+
+  docs/charts/page.template.html   page wording and structure
+  docs/charts/song.template.html   one song's block
+  docs/charts/chart.css            colors, type, and spacing
+  docs/charts/player.js            drum playback and the bar playhead
+
+Add a song by appending an object to songs/ready.json, then run this script.
+The eight original songs have locked start × length values in EXPECTED.
+A new id uses the ranges in the map and is not locked.
+This script does not rewrite MIDI files. Do not edit index.html by hand.
 """
 
 from __future__ import annotations
@@ -14,7 +22,10 @@ from xml.sax.saxutils import escape
 
 ROOT = Path(__file__).resolve().parents[1]
 MAP_PATH = ROOT / "songs" / "ready.json"
-OUT_PATH = ROOT / "docs" / "charts" / "index.html"
+CHARTS = ROOT / "docs" / "charts"
+OUT_PATH = CHARTS / "index.html"
+PAGE_TEMPLATE = CHARTS / "page.template.html"
+SONG_TEMPLATE = CHARTS / "song.template.html"
 
 DIVISION_ORDER = (
     ("intro", "Intro"),
@@ -88,10 +99,10 @@ EXPECTED = {
     },
     "why-dont-you-get-a-job": {
         "intro": (1, 17),
-        "pattern1": (18, 56),
+        "pattern1": (18, 15),
         "pattern1Fill": (17, 1),
-        "pattern2": (18, 56),
-        "pattern2Fill": (73, 1),
+        "pattern2": (33, 16),
+        "pattern2Fill": (48, 1),
         "ending": (74, 1),
     },
     "ramble-on": {
@@ -118,13 +129,23 @@ def read_vlq(data: bytes, index: int) -> tuple[int, int]:
 
 def parse_track(
     data: bytes,
-) -> tuple[list[tuple[int, int, int, int]], list[tuple[int, int]], list[tuple[int, int, int]], int, str]:
+) -> tuple[
+    list[tuple[int, int, int, int]],
+    list[tuple[int, int]],
+    list[tuple[int, int, int]],
+    int,
+    str,
+    list[tuple[int, int]],
+    list[str],
+]:
     index = 0
     tick = 0
     running = None
     notes: list[tuple[int, int, int, int]] = []
     tempos: list[tuple[int, int]] = []
     signatures: list[tuple[int, int, int]] = []
+    programs: list[tuple[int, int]] = []
+    instruments: list[str] = []
     end_tick = 0
     name = ""
 
@@ -158,6 +179,10 @@ def parse_track(
             index += length
             if meta_type == 0x03 and not name:
                 name = payload.decode("latin1", errors="replace").strip()
+            elif meta_type == 0x04:
+                instrument = payload.decode("latin1", errors="replace").strip()
+                if instrument:
+                    instruments.append(instrument)
             elif meta_type == 0x51 and len(payload) == 3:
                 microseconds = (payload[0] << 16) | (payload[1] << 8) | payload[2]
                 if microseconds:
@@ -180,6 +205,8 @@ def parse_track(
         else:
             kind = status & 0xF0
             if kind in (0xC0, 0xD0):
+                if kind == 0xC0:
+                    programs.append((status & 0x0F, data[index]))
                 index += 1
             elif kind in (0x80, 0x90, 0xA0, 0xB0, 0xE0):
                 note = data[index]
@@ -190,7 +217,7 @@ def parse_track(
             else:
                 raise ValueError(f"unsupported status {status:#x} at tick {tick}")
 
-    return notes, tempos, signatures, end_tick, name
+    return notes, tempos, signatures, end_tick, name, programs, instruments
 
 
 def parse_midi(path: Path) -> dict:
@@ -215,8 +242,15 @@ def parse_midi(path: Path) -> dict:
         length = int.from_bytes(data[position + 4 : position + 8], "big")
         track = data[position + 8 : position + 8 + length]
         position += 8 + length
-        track_notes, track_tempos, track_sigs, track_end, track_name = parse_track(track)
-        tracks.append({"name": track_name, "notes": track_notes})
+        track_notes, track_tempos, track_sigs, track_end, track_name, track_programs, track_instruments = parse_track(track)
+        tracks.append(
+            {
+                "name": track_name,
+                "notes": track_notes,
+                "programs": track_programs,
+                "instruments": track_instruments,
+            }
+        )
         tempos.extend(track_tempos)
         signatures.extend(track_sigs)
         end_tick = max(end_tick, track_end)
@@ -225,6 +259,18 @@ def parse_midi(path: Path) -> dict:
     drum_ticks = [tick for tick, _note, _velocity in drum_events]
     if drum_ticks:
         end_tick = max(drum_ticks) + 1
+    track_summaries = []
+    for track in tracks:
+        channels = sorted({channel for _tick, channel, _note, _velocity in track["notes"]})
+        track_summaries.append(
+            {
+                "name": track["name"],
+                "notes": len(track["notes"]),
+                "channels": channels,
+                "programs": track["programs"],
+                "instruments": track["instruments"],
+            }
+        )
 
     return {
         "ppq": ppq,
@@ -233,6 +279,7 @@ def parse_midi(path: Path) -> dict:
         "tempos": tempos,
         "signatures": signatures,
         "end_tick": end_tick,
+        "tracks": track_summaries,
     }
 
 
@@ -374,8 +421,24 @@ def length_of(span: list[int]) -> int:
     return span[1] - span[0] + 1
 
 
+def fill(template: str, values: dict[str, str]) -> str:
+    for key, value in values.items():
+        token = "{{" + key + "}}"
+        if token not in template:
+            raise SystemExit(f"template is missing {token}")
+        template = template.replace(token, value)
+    return template
+
+
 def check_expected(song: dict) -> None:
-    expected = EXPECTED[song["id"]]
+    expected = EXPECTED.get(song["id"])
+    if expected is None:
+        typed = ", ".join(
+            f"{label} {song['divisions'][key][0]}×{length_of(song['divisions'][key])}"
+            for key, label in DIVISION_ORDER
+        )
+        print(f"{song['title']}: new song, using the map ({typed})")
+        return
     for key, _label in DIVISION_ORDER:
         start, end = song["divisions"][key]
         got = (start, length_of(song["divisions"][key]))
@@ -669,34 +732,21 @@ def render_song(song: dict, midi_path: Path) -> str:
         f"meter={meter_text(meters)} maxHits={max(hits) if hits else 0} "
         f"first8={hits[:8]}"
     )
-    article = f"""
-<article id="{attr(song["id"])}">
-  <h2>{escape(song["artist"])} — {escape(song["title"])}</h2>
-  <p class="meta">{meta}</p>
-  {flag}
-  <div class="transport">
-    {play_button(song["id"], "the drum track", 1, len(hits), False, "Play drums")}
-    <button type="button" class="stop">Stop</button>
-    <span class="status" data-status-for="{attr(song["id"])}"></span>
-  </div>
-  <div class="chart-scroll">
-    {render_chart(song, hits, roles)}
-  </div>
-  <p class="caption">Column height is hits on the drum kit. Play uses those kit notes only. Patterns and fills repeat until you stop them. Intro, ending, and the whole track play once.</p>
-  <table class="sheet">
-    <caption>Type these into Rhythm Converter</caption>
-    <thead>
-      <tr><th>Listen</th><th>Division</th><th>Start measure</th><th>Length</th><th>File bars</th></tr>
-    </thead>
-    <tbody>
-      {typing_rows(song)}
-    </tbody>
-  </table>
-  {note_block}
-  <script type="application/json" class="drum-data" data-song="{attr(song["id"])}">DRUM_JSON</script>
-</article>
-"""
-    return article.replace("DRUM_JSON", playback_json(midi, boundaries))
+    song_id = attr(song["id"])
+    return fill(
+        SONG_TEMPLATE.read_text(encoding="utf-8"),
+        {
+            "ID": song_id,
+            "HEADING": f"{escape(song['artist'])} — {escape(song['title'])}",
+            "META": meta,
+            "FLAG": flag,
+            "PLAY_DRUMS": play_button(song["id"], "the drum track", 1, len(hits), False, "Play drums"),
+            "CHART": render_chart(song, hits, roles),
+            "ROWS": typing_rows(song),
+            "NOTES": note_block,
+            "DRUM_JSON": playback_json(midi, boundaries),
+        },
+    )
 
 
 def render_page(catalog: dict, songs_html: str) -> str:
@@ -707,175 +757,10 @@ def render_page(catalog: dict, songs_html: str) -> str:
         f"<li><strong>{escape(item['artist'])} — {escape(item['title'])}.</strong> {escape(item['reason'])}</li>"
         for item in catalog["excluded"]
     )
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>RC-10R section charts</title>
-  <style>
-    :root {{
-      --paper: #f3efe6;
-      --card: #fffdf8;
-      --ink: #1c1915;
-      --muted: #5c564c;
-      --line: #e4ddd0;
-      --intro: #1f7a4d;
-      --pattern1: #1d5c99;
-      --pattern2: #c46b12;
-      --ending: #6d3d86;
-      --unstored: #d9d4cc;
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0;
-      font-family: "Segoe UI", system-ui, sans-serif;
-      background: var(--paper);
-      color: var(--ink);
-      line-height: 1.45;
-    }}
-    header.page, .excluded {{
-      padding: 28px 32px 8px;
-      max-width: 980px;
-    }}
-    h1 {{
-      margin: 0 0 8px;
-      font-size: 1.85rem;
-      font-weight: 650;
-      letter-spacing: -0.02em;
-    }}
-    .lede {{ margin: 0 0 14px; color: var(--muted); max-width: 68ch; }}
-    nav {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 14px; }}
-    nav a {{
-      color: var(--ink);
-      background: var(--card);
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      padding: 4px 10px;
-      text-decoration: none;
-      font-size: 0.92rem;
-    }}
-    .legend {{ display: flex; flex-wrap: wrap; gap: 14px 18px; font-size: 0.92rem; margin: 0; padding: 0; list-style: none; }}
-    .swatch {{
-      width: 14px;
-      height: 14px;
-      display: inline-block;
-      vertical-align: -2px;
-      margin-right: 6px;
-      border-radius: 2px;
-    }}
-    .swatch.intro {{ background: var(--intro); }}
-    .swatch.pattern1 {{ background: var(--pattern1); }}
-    .swatch.pattern2 {{ background: var(--pattern2); }}
-    .swatch.ending {{ background: var(--ending); }}
-    .swatch.unstored {{ background: var(--unstored); }}
-    .swatch.fill {{ background: #fff; border: 2px solid #161513; width: 12px; height: 12px; }}
-    main {{ padding: 12px 32px 24px; }}
-    article {{
-      background: var(--card);
-      border: 1px solid var(--line);
-      border-radius: 12px;
-      padding: 20px 20px 8px;
-      margin: 0 0 22px;
-    }}
-    article h2 {{ margin: 0 0 4px; font-size: 1.4rem; }}
-    .meta {{ color: var(--muted); margin: 0 0 12px; }}
-    .flag {{
-      background: #fde8e4;
-      border: 1px solid #e3b0a6;
-      color: #6d2418;
-      padding: 8px 12px;
-      border-radius: 8px;
-      margin: 0 0 12px;
-    }}
-    .chart-scroll {{
-      overflow-x: auto;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: #fff;
-    }}
-    .caption {{ color: var(--muted); font-size: 0.92rem; margin: 8px 0 0; }}
-    table.sheet {{
-      border-collapse: collapse;
-      width: 100%;
-      max-width: 760px;
-      margin: 8px 0 12px;
-    }}
-    table.sheet caption {{
-      caption-side: top;
-      text-align: left;
-      font-weight: 650;
-      padding: 12px 0 6px;
-    }}
-    table.sheet th {{
-      text-align: left;
-      font-size: 0.75rem;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      color: var(--muted);
-      font-weight: 650;
-      padding: 6px 10px;
-      border-bottom: 1px solid var(--line);
-    }}
-    table.sheet td {{
-      padding: 8px 10px;
-      border-bottom: 1px solid var(--line);
-      vertical-align: middle;
-    }}
-    table.sheet td.num {{
-      font-size: 1.55rem;
-      font-weight: 700;
-      font-variant-numeric: tabular-nums;
-      width: 8.5rem;
-    }}
-    .transport {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 0 0 12px; }}
-    .transport .status {{ color: var(--muted); font-size: 0.92rem; }}
-    button.play, button.stop {{
-      font: inherit;
-      border: 0;
-      border-radius: 999px;
-      padding: 6px 12px;
-      cursor: pointer;
-    }}
-    button.play {{ background: #1c1915; color: #fffdf8; }}
-    button.play[aria-pressed="true"] {{ background: var(--intro); }}
-    button.stop {{ background: transparent; color: var(--ink); border: 1px solid var(--line); }}
-    tr.is-playing {{ background: #f6f1e6; }}
-    .range {{ color: var(--muted); font-size: 0.9rem; }}
-    .notes {{ margin: 0 0 12px; padding-left: 18px; }}
-    .excluded h2 {{ font-size: 1.25rem; margin-bottom: 8px; }}
-    .excluded ul {{ padding-left: 18px; }}
-    .excluded li {{ margin: 6px 0; }}
-  </style>
-</head>
-<body>
-  <header class="page">
-    <h1>RC-10R section charts</h1>
-    <p class="lede">Open the MIDI in Rhythm Converter, delete the user pattern already in that memory, then type the start measure and length for each division. Play a division or the whole file to hear the drum kit on its own. Fills are one bar and can sit inside another division. Ranges are the file’s own measures, starting at 1.</p>
-    <nav>{nav}</nav>
-    <ul class="legend">
-      <li><span class="swatch intro"></span>Intro</li>
-      <li><span class="swatch pattern1"></span>Pattern 1</li>
-      <li><span class="swatch pattern2"></span>Pattern 2</li>
-      <li><span class="swatch ending"></span>Ending</li>
-      <li><span class="swatch unstored"></span>Not stored</li>
-      <li><span class="swatch fill"></span>Fill, one bar</li>
-    </ul>
-  </header>
-  <main>
-    {songs_html}
-  </main>
-  <section class="excluded" id="not-ready">
-    <h2>Do not assign</h2>
-    <p class="lede">These files do not match the song’s tempo, meter, or length, so they have no typing numbers.</p>
-    <ul>
-      {excluded}
-    </ul>
-  </section>
-  <script src="player.js?v=2"></script>
-</body>
-</html>
-"""
+    return fill(
+        PAGE_TEMPLATE.read_text(encoding="utf-8"),
+        {"NAV": nav, "SONGS": songs_html, "EXCLUDED": excluded},
+    )
 
 
 def main() -> None:
