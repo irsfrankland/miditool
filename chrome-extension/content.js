@@ -1,9 +1,13 @@
 // Reads the Songsterr player: is it playing, which measure the cursor is on,
 // and when that measure began. Measures are counted from 0 like the tab file;
 // the page labels measure N with the number N and leaves the first one blank.
+// Playing is confirmed for a few reads before it flips. When a new bar is
+// confirmed, the cursor's place in that bar is kept so a late confirm does not
+// pretend the drums are still on beat 1.
 (() => {
   const READ_MS = 15;
   const HEARTBEAT_MS = 200;
+  const PLAY_CONFIRM = 3;
   const BAR_LEAD = 8;
 
   let measure = null;
@@ -12,6 +16,8 @@
   let markFraction = 0;
   let lastSent = 0;
   let stopped = false;
+  let nextPlaying = false;
+  let playingVotes = PLAY_CONFIRM;
 
   function cursor() {
     for (const use of document.querySelectorAll('use[href^="#cursor-playhead-"]')) {
@@ -106,22 +112,39 @@
     }
   }
 
+  function confirmPlaying(nowPlaying) {
+    if (nowPlaying === nextPlaying) {
+      playingVotes += 1;
+    } else {
+      nextPlaying = nowPlaying;
+      playingVotes = 1;
+    }
+    if (playingVotes < PLAY_CONFIRM || nextPlaying === playing) return false;
+    playing = nextPlaying;
+    return true;
+  }
+
   function tick() {
     if (stopped) return;
     const now = Date.now();
     const position = readPosition();
     const nowPlaying = isPlaying();
     let changed = false;
-    if (position && position.measure !== measure) {
-      measure = position.measure;
+    if (confirmPlaying(nowPlaying)) {
       markAt = now;
-      markFraction = nowPlaying && playing ? 0 : position.fraction;
+      markFraction = position ? position.fraction : markFraction;
       changed = true;
     }
-    if (nowPlaying !== playing) {
-      playing = nowPlaying;
+    if (position && position.measure !== measure) {
+      // New bar: keep where the cursor already is. Do not force fraction back to
+      // 0, or a late reading leaves the drums behind until the next bar.
+      measure = position.measure;
       markAt = now;
-      markFraction = position ? position.fraction : 0;
+      markFraction = position.fraction;
+      changed = true;
+    } else if (position && !playing && Math.abs(position.fraction - markFraction) > 0.02) {
+      markFraction = position.fraction;
+      markAt = now;
       changed = true;
     }
     if (changed || now - lastSent >= HEARTBEAT_MS) send(now);

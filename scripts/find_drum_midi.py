@@ -1334,6 +1334,11 @@ class Finder:
         self.chrome_played: int | None = None
         self.chrome_mark: tuple | None = None
         self.chrome_text = ""
+        self.chrome_want = ""
+        self.chrome_want_at = 0.0
+        self.chrome_good: dict | None = None
+        self.chrome_good_at = 0.0
+        self.chrome_slot = 34
         self.loop_start = tk.StringVar()
         self.loop_bars = tk.StringVar()
         self._selecting = False
@@ -1513,11 +1518,16 @@ class Finder:
         self.tab_info = ttk.Label(info, text="Songsterr: pick a song.", style="Muted.TLabel", justify="left")
         self.tab_info.grid(row=0, column=0, sticky="w")
         self.tab_tip = Tooltip(self.tab_info)
-        self.chrome_label = ttk.Label(info, text="", style="Muted.TLabel")
-        self.chrome_label.grid(row=0, column=1, sticky="e", padx=(12, 0))
+        # A fixed-width slot so the Songsterr line on the left does not reflow
+        # every time the Chrome status changes length.
+        self.chrome_slot_frame = ttk.Frame(info, width=280)
+        self.chrome_slot_frame.grid(row=0, column=1, sticky="e", padx=(12, 0))
+        self.chrome_slot_frame.grid_propagate(False)
+        self.chrome_label = ttk.Label(self.chrome_slot_frame, text="", style="Muted.TLabel", anchor="e")
+        self.chrome_label.pack(fill="x")
         info.bind(
             "<Configure>",
-            lambda event: self.tab_info.configure(wraplength=max(240, event.width - self.chrome_label.winfo_reqwidth() - 24)),
+            lambda event: self.tab_info.configure(wraplength=max(240, event.width - self.chrome_slot_frame.winfo_reqwidth() - 24)),
         )
         for entry in (self.loop_start_entry, self.loop_bars_entry):
             entry.bind("<FocusOut>", self.on_loop_fields)
@@ -3008,13 +3018,17 @@ class Finder:
     # Songsterr in Chrome
 
     def chrome_state(self) -> tuple[dict | None, str]:
-        """The page state when it is fresh and shows this song, else None and why."""
+        """The page state when it is fresh and shows this song, else None and why.
+
+        Brief dropouts (a late heartbeat or a missing cursor) keep the last good
+        reading for half a second so the status line does not flicker.
+        """
         if self.bridge.error:
             return None, self.bridge.error
         state, age = self.bridge.latest()
         if state is None:
             return None, "Chrome: not connected (Songsterr › Set up Chrome…)"
-        if age > 1.5:
+        if age > 2.0:
             return None, "Chrome: stopped answering"
         if self.tab is None:
             return None, "Chrome: connected, waiting for the tab"
@@ -3022,7 +3036,12 @@ class Finder:
             title = str(state.get("title") or "another song").split(" Tab")[0].split(" Drum")[0]
             return None, f"Chrome: showing {title}"
         if state.get("measure") is None:
+            now = time.perf_counter()
+            if self.chrome_good and now - self.chrome_good_at < 0.5:
+                return self.chrome_good, ""
             return None, "Chrome: cursor not visible yet"
+        self.chrome_good = state
+        self.chrome_good_at = time.perf_counter()
         return state, ""
 
     def chrome_live(self) -> bool:
@@ -3033,15 +3052,24 @@ class Finder:
             self.playing["follow"] = False
         self.chrome_played = None
         self.chrome_mark = None
+        self.chrome_good = None
+        self.chrome_want = ""
+        self.show_chrome_text("" if not self.follow_chrome.get() else self.chrome_text)
 
     def chrome_target(self, state: dict) -> tuple[float, int, int] | None:
-        """Where the MIDI should be now: (ms, tab bar played, MIDI bar)."""
+        """Where the MIDI should be now: (ms, tab bar played, MIDI bar).
+
+        Progress inside a bar is wall-clock time from the last bar mark, not the
+        on-screen cursor. Songsterr's playhead pixels are not a steady musical
+        clock. When a bar is confirmed late, markFraction says how far in it
+        already was, so that bar does not start from beat 1 behind Songsterr.
+        """
         tab, view = self.tab, self.view
         source = int(state["measure"]) + 1
         played = [index for index, bar in enumerate(tab.bars, start=1) if bar.get("source") == source]
         if not played:
             return None
-        mark = (state.get("measure"), state.get("markAt"), state.get("playing"))
+        mark = (state.get("measure"), state.get("markAt"))
         if mark != self.chrome_mark or self.chrome_played not in played:
             last = self.chrome_played
             ahead = [index for index in played if last is not None and index >= last]
@@ -3064,35 +3092,44 @@ class Finder:
         elapsed = time.time() * 1000 - float(state.get("markAt") or 0)
         if not state.get("playing"):
             elapsed = 0.0
-        elapsed = max(0.0, min(elapsed, length * share * 1.5))
-        start = float(state.get("markFraction") or 0.0)
+        speed = max(25, min(200, int(state.get("speed") or 100))) / 100.0
+        elapsed = max(0.0, min(elapsed * speed, length * share * 1.5))
+        start = min(1.0, max(0.0, float(state.get("markFraction") or 0.0)))
         target = bar_ms[midi_bar - 1] + (inner + start * share) * length + elapsed
         return min(target, bar_ms[-1] - 1), bar, midi_bar
 
     def poll_chrome(self) -> None:
-        self.root.after(30, self.poll_chrome)
+        self.root.after(40, self.poll_chrome)
         state, why = self.chrome_state()
         following = bool(self.playing and self.playing.get("follow"))
-        if not self.follow_chrome.get() or not self.view:
-            self.show_chrome_text("" if not self.follow_chrome.get() else why)
+        if not self.follow_chrome.get():
+            self.show_chrome_text("")
+            return
+        if not self.view:
+            self.show_chrome_text(why, hold=0.2)
             return
         if state is None:
-            self.show_chrome_text(why)
-            return
+            # Keep the last live line briefly when Chrome hiccups.
+            if self.chrome_good and time.perf_counter() - self.chrome_good_at < 0.6 and why.startswith("Chrome: stopped"):
+                state = self.chrome_good
+            else:
+                self.show_chrome_text(why, hold=0.35)
+                return
         if self.pending_pedal or (self.playing and self.playing.get("pedal")):
-            self.show_chrome_text("Chrome: paused for the pedal rehearsal")
+            self.show_chrome_text("Chrome: paused for the pedal rehearsal", hold=0.15)
             return
         found = self.chrome_target(state)
         speed = int(state.get("speed") or 100)
-        slow = f" · tab at {speed}% speed" if speed != 100 else ""
+        slow = f" · {speed}%" if speed != 100 else ""
         if found is None:
-            self.show_chrome_text(f"Chrome: tab bar {int(state['measure']) + 1} is outside this MIDI" + slow)
+            self.show_chrome_text(f"Chrome: tab bar {int(state['measure']) + 1} is outside this MIDI" + slow, hold=0.25)
             if following and not self.playing.get("paused"):
                 self.pause_playback()
             return
         target, tab_bar, midi_bar = found
-        word = "Playing" if state.get("playing") else "Paused"
-        self.show_chrome_text(f"Chrome: {word.lower()} · tab bar {tab_bar} = MIDI bar {midi_bar}" + slow)
+        word = "playing" if state.get("playing") else "paused"
+        # Same width family of messages so the right-hand text does not dance.
+        self.show_chrome_text(f"Chrome: {word} · bar {tab_bar} → {midi_bar}{slow}", hold=0.12)
         if not state.get("playing"):
             if following and not self.playing.get("paused"):
                 self.pause_playback()
@@ -3109,7 +3146,7 @@ class Finder:
         drift = self.playhead_ms() - target
         new_bar = self.playing.get("synced_mark") != self.chrome_mark
         self.playing["synced_mark"] = self.chrome_mark
-        if self.playing.get("paused") or abs(drift) > 300 or (new_bar and abs(drift) > 35):
+        if self.playing.get("paused") or abs(drift) > 300 or (new_bar and abs(drift) > 30):
             self.follow_seek(target)
 
     def follow_seek(self, target: float) -> None:
@@ -3131,10 +3168,26 @@ class Finder:
             self.tick_playhead()
             self.refresh_transport()
 
-    def show_chrome_text(self, text: str) -> None:
-        if text != self.chrome_text:
-            self.chrome_text = text
-            self.chrome_label["text"] = text
+    def show_chrome_text(self, text: str, hold: float = 0.0) -> None:
+        """Update the Chrome line. hold keeps a previous message until the new one sticks."""
+        now = time.perf_counter()
+        if text == self.chrome_text:
+            self.chrome_want = text
+            self.chrome_want_at = now
+            return
+        if text != self.chrome_want:
+            self.chrome_want = text
+            self.chrome_want_at = now
+            if hold > 0 and self.chrome_text:
+                return
+        elif hold > 0 and now - self.chrome_want_at < hold and self.chrome_text:
+            return
+        self.chrome_text = text
+        self.chrome_label["text"] = text
+        width = max(12, len(text) + 2)
+        if width > self.chrome_slot:
+            self.chrome_slot = width
+            self.chrome_slot_frame.configure(width=max(280, self.chrome_slot * 7))
 
     def chrome_setup(self) -> None:
         folder = ROOT / "chrome-extension"
