@@ -27,6 +27,9 @@ INK = "#f3f1eb"
 MUTED = "#c2beb4"
 PLAYHEAD = "#e24b3a"
 GRID_BG = "#1c2029"
+SELECT = "#4fc3ff"
+SELECT_SHADE = "#3a4250"
+PICK = "#ff4d4d"
 GRID_LEVEL = "#242a35"
 GRID_BAR = "#2a303c"
 GRID_PHRASE = "#3c4453"
@@ -113,6 +116,7 @@ class SectionChart(ttk.Frame):
         self.on_bar_click = None
         self.on_bars_chosen = None
         self.on_bars_inserted = None
+        self.on_deselect = None
         self._selection: tuple[int, int] | None = None
         self._press_bar: int | None = None
         self._press_x = 0
@@ -121,8 +125,16 @@ class SectionChart(ttk.Frame):
         self._insert_x = 0
         self._inserting = False
         self._content = 248
+        self._panning = False
+        self._bar_items: list[tuple[int, str]] = []
+        self._painted: list[int] = []
+        self._grid_bg: int | None = None
+        self.pick: int | None = None
         self.canvas.configure(cursor="hand2", takefocus=True)
-        self.canvas.bind("<Control-MouseWheel>", self._on_wheel)
+        self.canvas.bind("<Motion>", self._on_hover)
+        self.canvas.bind("<Leave>", lambda _event: self._hide_pick())
+        self.canvas.bind("<MouseWheel>", self._on_wheel)
+        self.canvas.bind("<Shift-MouseWheel>", self._on_shift_wheel)
         self.canvas.bind("<ButtonPress-1>", self._press)
         self.canvas.bind("<B1-Motion>", self._motion)
         self.canvas.bind("<ButtonRelease-1>", self._release)
@@ -170,19 +182,37 @@ class SectionChart(ttk.Frame):
         nxt = self.zoom_index + direction
         return bool(self._hits) and 0 <= nxt < len(self.steps)
 
-    def zoom(self, direction: int) -> None:
+    def zoom(self, direction: int, anchor: int | None = None) -> None:
+        """Zoom one step. The bar under window x anchor stays put; without one, the left edge does."""
         if not self.can_zoom(direction):
             return
-        fraction = self.canvas.canvasx(0) / max(1, self.full_width)
+        if anchor is None:
+            anchor = 0
+        bar_pos = (self.canvas.canvasx(anchor) - self.pad) / self.step
         self.zoom_index += direction
         self.step = self.steps[self.zoom_index]
         self.draw(self._hits, self._divisions, self._parts, self._lanes, self._crashes, self._meters)
-        self.canvas.xview_moveto(fraction)
+        left = self.pad + bar_pos * self.step - anchor
+        self.canvas.xview_moveto(max(0.0, left / max(1, self.full_width)))
         if self.on_zoom_changed is not None:
             self.on_zoom_changed()
 
-    def _on_wheel(self, event: tk.Event) -> None:
-        self.zoom(1 if event.delta > 0 else -1)
+    def _on_wheel(self, event: tk.Event) -> str:
+        self.zoom(1 if event.delta > 0 else -1, event.x)
+        return "break"
+
+    def _on_shift_wheel(self, event: tk.Event) -> str:
+        self.canvas.xview_scroll(-3 if event.delta > 0 else 3, "units")
+        return "break"
+
+    def in_plot(self, event: tk.Event, past_end: bool = False) -> bool:
+        """True over the bars or the section names above them. Clicks there select; below, a click deselects and a drag pans."""
+        if not self._hits:
+            return False
+        x = self.canvas.canvasx(event.x)
+        y = self.canvas.canvasy(event.y)
+        right = self.pad + (len(self._hits) + (1 if past_end else 0)) * self.step
+        return y <= self.plot_bottom and self.pad <= x < right
 
     def bar_at(self, event: tk.Event) -> int | None:
         if not self._hits:
@@ -202,7 +232,7 @@ class SectionChart(ttk.Frame):
         return int((x - self.pad) // self.step) + 1
 
     def _insert_press(self, event: tk.Event) -> None:
-        if not self._hits:
+        if not self.in_plot(event, past_end=True):
             return
         self.canvas.focus_set()
         self._insert_slot = self.slot_at(event)
@@ -264,17 +294,28 @@ class SectionChart(ttk.Frame):
         self._raise_playhead()
 
     def _press(self, event: tk.Event) -> None:
-        bar = self.bar_at(event)
-        if bar is None:
+        if not self._hits:
             return
         self.canvas.focus_set()
-        self._press_bar = bar
+        if not self.in_plot(event):
+            self._panning = True
+            self._press_x = event.x
+            self._dragged = False
+            self.canvas.scan_mark(event.x, 0)
+            return
+        self._press_bar = self.bar_at(event)
         self._press_x = event.x
         self._dragged = False
 
     def _motion(self, event: tk.Event) -> None:
+        if self._panning:
+            if abs(event.x - self._press_x) > 4:
+                self._dragged = True
+            self.canvas.scan_dragto(event.x, 0, gain=1)
+            return
         if self._press_bar is None:
             return
+        self._on_hover(event)
         bar = self.bar_at(event)
         if bar is None:
             return
@@ -284,6 +325,11 @@ class SectionChart(ttk.Frame):
             self.show_selection(start, end)
 
     def _release(self, event: tk.Event) -> None:
+        if self._panning:
+            self._panning = False
+            if not self._dragged and self.on_deselect is not None:
+                self.on_deselect()
+            return
         if self._press_bar is None:
             return
         bar = self.bar_at(event) or self._press_bar
@@ -301,6 +347,11 @@ class SectionChart(ttk.Frame):
 
     def show_selection(self, start: int | None, end: int | None) -> None:
         self.canvas.delete("selection")
+        for index in self._painted:
+            if index < len(self._bar_items):
+                item, fill = self._bar_items[index]
+                self.canvas.itemconfigure(item, fill=fill)
+        self._painted = []
         if start is None or end is None or not self._hits:
             self._selection = None
             return
@@ -310,8 +361,41 @@ class SectionChart(ttk.Frame):
         self._selection = (start, end)
         x0 = self.pad + (start - 1) * self.step
         x1 = self.pad + end * self.step
-        self.canvas.create_rectangle(x0, self.plot_top, x1, self.plot_bottom, outline="#e4a24a", width=2, tags="selection")
+        shade = self.canvas.create_rectangle(x0, self.plot_top, x1, self.plot_bottom, fill=SELECT_SHADE, width=0, tags="selection")
+        if self._grid_bg is not None:
+            self.canvas.tag_raise(shade, self._grid_bg)
+        for index in range(start - 1, min(end, len(self._bar_items))):
+            self.canvas.itemconfigure(self._bar_items[index][0], fill=SELECT)
+            self._painted.append(index)
+        count = end - start + 1
+        text = f"Bar {start}" if count == 1 else f"Bars {start}–{end}  ·  {count} bars"
+        label = self.canvas.create_text(
+            x0 + 5, self.plot_top + 4, text=text, anchor="nw", fill=CHART_BG, font=self.bar_font, tags="selection"
+        )
+        left, top, right, bottom = self.canvas.bbox(label)
+        backing = self.canvas.create_rectangle(
+            left - 4, top - 1, right + 4, bottom + 1, fill=SELECT, width=0, tags="selection"
+        )
+        self.canvas.tag_lower(backing, label)
         self._raise_playhead()
+
+    def _on_hover(self, event: tk.Event) -> None:
+        """A pick line on the bar under the pointer, anywhere in the bar chart's height."""
+        if self.pick is None or self._panning:
+            return
+        if not self.in_plot(event):
+            self._hide_pick()
+            return
+        bar = self.bar_at(event)
+        x = self.pad + (bar - 1) * self.step + self.bar_w / 2
+        y = min(self.canvas.canvasy(event.y), self.plot_bottom)
+        self.canvas.coords(self.pick, x, y, x, self.plot_bottom)
+        self.canvas.itemconfigure(self.pick, state="normal")
+        self.canvas.tag_raise(self.pick)
+
+    def _hide_pick(self) -> None:
+        if self.pick is not None:
+            self.canvas.itemconfigure(self.pick, state="hidden")
 
     def reveal(self, bar: int) -> None:
         if not self._hits or not 1 <= bar <= len(self._hits):
@@ -357,6 +441,8 @@ class SectionChart(ttk.Frame):
         meters: list[tuple[int, int]] | None = None,
     ) -> None:
         chosen = self._selection
+        self._bar_items = []
+        self._painted = []
         self._hits = list(hits)
         self._divisions = divisions
         self._parts = list(parts or [])
@@ -465,7 +551,8 @@ class SectionChart(ttk.Frame):
             column = self._base if count_hits == 0 else self._base + round(count_hits / peak * self._span)
             x = self.pad + (bar - 1) * self.step
             y = self.plot_bottom - column
-            self.canvas.create_rectangle(x, y, x + self.bar_w, self.plot_bottom, fill=ROLE[role], width=0)
+            item = self.canvas.create_rectangle(x, y, x + self.bar_w, self.plot_bottom, fill=ROLE[role], width=0)
+            self._bar_items.append((item, ROLE[role]))
             if self.bar_w >= 12:
                 beats, _pulses = self.beats_in(*self.meter_of(bar))
                 divider = _blend(ROLE[role], 0.58)
@@ -509,6 +596,7 @@ class SectionChart(ttk.Frame):
         self.head = self.canvas.create_line(
             0, self.plot_top - 4, 0, self.plot_bottom, fill=PLAYHEAD, width=2, state="hidden"
         )
+        self.pick = self.canvas.create_line(0, self.plot_top, 0, self.plot_bottom, fill=PICK, width=1, state="hidden")
         if chosen:
             self.show_selection(*chosen)
 
@@ -530,7 +618,7 @@ class SectionChart(ttk.Frame):
         left = self.pad - 1
         right = self.pad + count * self.step - 1
         top, bottom = self.plot_top, self.plot_bottom
-        self.canvas.create_rectangle(left, top, right, bottom, fill=GRID_BG, width=0, tags="grid")
+        self._grid_bg = self.canvas.create_rectangle(left, top, right, bottom, fill=GRID_BG, width=0, tags="grid")
         for share in (0.25, 0.5, 0.75, 1.0):
             y = bottom - (self._base + share * self._span)
             self.canvas.create_line(left, y, right, y, fill=GRID_LEVEL, tags="grid")

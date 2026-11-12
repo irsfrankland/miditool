@@ -171,6 +171,23 @@
         "ending": [81, 83]
       },
       "notes": []
+    },
+    {
+      "id": "aerials",
+      "title": "Aerials",
+      "artist": "System of a Down",
+      "file": "System of a Down/System of a Down — Aerials (18) [MIDIfind.com].mid",
+      "divisions": {
+        "intro": [1, 48],
+        "pattern1": [49, 63],
+        "pattern1Fill": [48, 48],
+        "pattern2": [65, 80],
+        "pattern2Fill": [80, 80],
+        "ending": [151, 151]
+      },
+      "notes": [
+        "This file has many tempo changes. Set one tempo in Rhythm Converter before you assign. This chart does not rewrite the file."
+      ]
     }
   ],
   "excluded": [

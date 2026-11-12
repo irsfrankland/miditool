@@ -1232,8 +1232,8 @@ class Finder:
         self.loop_bars_entry = ttk.Entry(loop, textvariable=self.loop_bars, width=3)
         self.loop_bars_entry.pack(side="left")
         bar.add(loop, 12)
-        Tooltip(loop, "Loop from a bar, for a number of bars. Drag on the chart to pick bars. Left and Right move the loop; Shift resizes it.")
-        bars_button = ttk.Menubutton(bar, text="Selected bars  ▾", menu=self.bars_menu, style="Menu.TMenubutton")
+        Tooltip(loop, "Loop from a bar, for a number of bars. Drag on the bars to pick them. Left and Right move the loop; Shift resizes it.")
+        bars_button = self.bars_button = ttk.Menubutton(bar, text="Selected bars  ▾", menu=self.bars_menu, style="Menu.TMenubutton")
         bar.add(bars_button, 12)
         Tooltip(bars_button, "Make the selected bars a pedal part, or delete or blank them. A fill uses the last selected bar.")
         tool("Pedal rehearsal", self.open_pedal, space=12, tip="Practise the RC-10R footswitch along with this song.")
@@ -1341,6 +1341,7 @@ class Finder:
         self.chart.on_bar_click = self.on_bar_click
         self.chart.on_bars_chosen = self.on_bars_chosen
         self.chart.on_bars_inserted = self.on_bars_inserted
+        self.chart.on_deselect = self.clear_selection
         self.chart.grid(row=3, column=0, sticky="nsew", pady=(0, 6))
 
         lower = ttk.Frame(right)
@@ -2015,7 +2016,7 @@ class Finder:
                 start, end = self.selection
                 self.start_playback(start, self.span_label(start, end), (start, end))
             else:
-                self.start_playback(1, "the drum track", None)
+                self.start_playback(self.selection[0] if self.selection else 1, "the drum track", None)
             return
         try:
             if self.view["editable"]:
@@ -2117,23 +2118,28 @@ class Finder:
 
     def on_bars_chosen(self, start: int, end: int) -> None:
         self.apply_selection(start, end)
-        if self.loop_on.get():
-            self.start_playback(start, self.span_label(start, end), (start, end))
+
+    def clear_selection(self) -> None:
+        if not self.view or self.selection is None:
+            return
+        self.selection = None
+        self._selecting = True
+        self.loop_start.set("")
+        self.loop_bars.set("")
+        self._selecting = False
+        self.chart.show_selection(None, None)
+        self.refresh_transport()
 
     def on_bar_click(self, bar: int) -> None:
+        """Select the bar; Play or Space starts from it. With Loop on, the loop moves there and keeps its length."""
         if not self.view:
             return
-        loop_bars = None
-        if self.loop_on.get():
-            if self.selection and not self.selection[0] <= bar <= self.selection[1]:
+        if self.loop_on.get() and self.selection:
+            if not self.selection[0] <= bar <= self.selection[1]:
                 length = self.selection[1] - self.selection[0] + 1
-                end = min(len(self.view["hits"]), bar + length - 1)
-                self.apply_selection(bar, end)
-            elif not self.selection:
-                self.apply_selection(bar, bar)
-            loop_bars = self.selection
-        label = self.span_label(*loop_bars) if loop_bars else "the drum track"
-        self.start_playback(bar, label, loop_bars)
+                self.apply_selection(bar, min(len(self.view["hits"]), bar + length - 1))
+            return
+        self.apply_selection(bar, bar)
 
     def on_loop_toggle(self) -> None:
         if self._selecting or self._loading or not self.view:
@@ -3216,9 +3222,10 @@ class Finder:
         messagebox.showinfo(
             "Chart and keyboard tips",
             "Chart\n"
-            "• Click a bar to play from it. Drag to select bars.\n"
-            "• Right-drag adds silent bars.\n"
-            "• Ctrl + mouse wheel zooms.\n\n"
+            "• On the bars or the section names above them: click to pick a bar, drag to select bars, right-drag to add silent bars.\n"
+            "• Play or Space starts from the selected bar.\n"
+            "• Below the bars: click to clear the selection, drag to pan.\n"
+            "• Mouse wheel over the chart zooms at the pointer. Shift + wheel scrolls sideways.\n\n"
             "Keys\n"
             "• Space plays and pauses.\n"
             "• Left and Right move the loop; Shift resizes it.\n"
@@ -3492,6 +3499,11 @@ class Finder:
         else:
             self.pause_button.configure(text="Pause", state="disabled")
         chosen = "normal" if self.selection and self.view else "disabled"
+        if self.selection and self.view:
+            start, end = self.selection
+            self.bars_button["text"] = (f"Bar {start}" if start == end else f"Bars {start}–{end}") + "  ▾"
+        else:
+            self.bars_button["text"] = "Selected bars  ▾"
         self.delete_button.configure(state=chosen)
         self.blank_button.configure(state=chosen)
         for button in self.assign_buttons:
