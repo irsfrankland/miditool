@@ -18,7 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MAP_PATH = Path(os.environ.get("APPDATA") or ROOT) / "MidiTool" / "song-list.json"
 OLD_MAP_PATH = ROOT / "songs" / "ready.json"
-BLANK_LIST = {"drumRoot": "../Drum Tracks/Artists", "songs": [], "excluded": []}
+BLANK_LIST = {"drumRoot": str(Path.home() / "Documents" / "MidiTool" / "Drum Tracks"), "songs": [], "excluded": []}
 
 
 def ensure_song_list() -> Path:

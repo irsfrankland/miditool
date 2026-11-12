@@ -152,17 +152,41 @@ def find(artist: str, title: str, with_track: bool = True) -> Tab | None:
     songs = _json(f"{API}/songs?pattern=" + urllib.parse.quote(query))
     if not isinstance(songs, list) or not songs:
         return None
-    song = songs[0]
+    tab = tab_for(songs[0], artist, title)
+    if tab is not None and with_track:
+        try:
+            load_track(tab)
+        except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError) as exc:
+            tab.error = f"Songsterr's tab data could not be read ({exc})."
+    return tab
+
+
+def search_tabs(query: str, limit: int = 40) -> list[Tab]:
+    """Songsterr's own search, keeping the songs that have a drum part. Bars are not loaded."""
+    songs = _json(f"{API}/songs?pattern=" + urllib.parse.quote(query.strip()) + "&size=50")
+    found: list[Tab] = []
+    for song in songs if isinstance(songs, list) else []:
+        if song.get("isJunk"):
+            continue
+        tab = tab_for(song, "", "")
+        if tab is not None and tab.drum_track is not None:
+            found.append(tab)
+        if len(found) >= limit:
+            break
+    return found
+
+
+def tab_for(song: dict, artist: str, title: str) -> Tab | None:
+    """A Tab for one song from Songsterr's search results."""
     song_id = song.get("songId")
     if not song_id:
         return None
     found_artist = str(song.get("artist") or artist).strip()
     found_title = str(song.get("title") or title).strip()
     tracks = song.get("tracks") or []
-    drum = next(
-        (index for index, track in enumerate(tracks) if str(track.get("instrument", "")).lower() == "drums"),
-        None,
-    )
+    drum = song.get("popularTrackDrum")
+    if not (isinstance(drum, int) and 0 <= drum < len(tracks) and _is_drums(tracks[drum])):
+        drum = next((index for index, track in enumerate(tracks) if _is_drums(track)), None)
     base = f"https://www.songsterr.com/a/wsa/{slug(found_artist)}-{slug(found_title)}-tab-s{song_id}"
     if drum is None:
         tab = Tab(song_id, found_artist, found_title, base, f"Songsterr tab · {found_artist} — {found_title}")
@@ -182,12 +206,11 @@ def find(artist: str, title: str, with_track: bool = True) -> Tab | None:
         except (TypeError, ValueError):
             views = 0
         tab.parts.append(Part(index, part_kind(track), part_name(str(track.get("name") or track.get("instrument") or "")), views))
-    if with_track:
-        try:
-            load_track(tab)
-        except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError) as exc:
-            tab.error = f"Songsterr's tab data could not be read ({exc})."
     return tab
+
+
+def _is_drums(track: dict) -> bool:
+    return track.get("instrumentId") == DRUM_INSTRUMENT or str(track.get("instrument", "")).lower() == "drums"
 
 
 CACHE_DAYS = 7

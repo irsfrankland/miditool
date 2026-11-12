@@ -1,4 +1,4 @@
-"""Find a free MIDI on MIDIfind or MIDIWORLD, then read its drum kit.
+"""Find a free MIDI on MIDIfind or MIDIWORLD, or build one from a Songsterr drum tab, then read its drum kit.
 
 The saved song list opens in this window with the section chart. A new
 download gets a suggested intro, two loops, two fills, and an ending.
@@ -98,6 +98,7 @@ class Hit:
     page_url: str
     download_url: str
     more: bool = False
+    tab: songsterr.Tab | None = None
 
 
 class Web:
@@ -213,8 +214,34 @@ def search(artist: str, song: str, sites: list[str]) -> tuple[list[Hit], str]:
         hits.extend(found)
         if more:
             notes.append("MIDIWORLD has another page. Add a word and search again.")
+    if "Songsterr" in sites:
+        hits.extend(search_songsterr(query))
     hits.sort(key=lambda hit: rank(hit.title, artist, song), reverse=True)
     return hits, " ".join(notes)
+
+
+def search_songsterr(query: str) -> list[Hit]:
+    """Songsterr songs with a drum part. Downloading one turns that part into a MIDI."""
+    found = []
+    for tab in songsterr.search_tabs(query):
+        part = next((part for part in tab.parts if part.index == tab.drum_track), None)
+        player = f"  ·  {part.name}" if part and part.name not in ("Drums", "Unnamed part") else ""
+        found.append(Hit("Songsterr", f"{tab.artist} — {tab.title}{player}", tab.url, "", tab=tab))
+    return found
+
+
+def songsterr_midi(tab: songsterr.Tab, ppq: int = 480) -> Path:
+    """Write the tab's drum part as a type 0 MIDI in incoming."""
+    _meta, track = songsterr.drum_part(tab)
+    drums = songsterr.drums_to_midi(track, ppq)
+    if not drums.ticks:
+        raise ValueError("Songsterr's drum part for this song has no notes.")
+    data = midi_export.build(ppq, drums.ticks, drums.tempos, drums.bounds, drums.meters, f"{tab.artist} - {tab.title}")
+    INCOMING.mkdir(parents=True, exist_ok=True)
+    name = safe_name(f"{tab.artist} - {tab.title} [Songsterr {tab.song_id}].mid", "songsterr.mid")
+    path = unique_path(INCOMING / name)
+    path.write_bytes(data)
+    return path
 
 
 def resolve_download(web: Web, hit: Hit) -> tuple[str, str]:
@@ -232,6 +259,8 @@ def resolve_download(web: Web, hit: Hit) -> tuple[str, str]:
 
 
 def save_midi(web: Web, hit: Hit) -> Path:
+    if hit.tab is not None:
+        return songsterr_midi(hit.tab)
     referer = hit.page_url if hit.site == "MIDIfind" else "https://www.midiworld.com/"
     url, filename = resolve_download(web, hit)
     _final, data = web.get(url, referer, 8_000_000)
@@ -1288,8 +1317,12 @@ class Finder:
         self.use_midiworld = tk.BooleanVar(value=True)
         sites = ttk.Frame(find)
         sites.grid(row=4, column=0, sticky="w")
-        ttk.Checkbutton(sites, text="MIDIfind", variable=self.use_midifind).pack(side="left")
-        ttk.Checkbutton(sites, text="MIDIWORLD", variable=self.use_midiworld).pack(side="left", padx=(10, 0))
+        self.use_songsterr = tk.BooleanVar(value=True)
+        songsterr_box = ttk.Checkbutton(sites, text="Songsterr drum tabs", variable=self.use_songsterr)
+        songsterr_box.grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Checkbutton(sites, text="MIDIfind", variable=self.use_midifind).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Checkbutton(sites, text="MIDIWORLD", variable=self.use_midiworld).grid(row=1, column=1, sticky="w", padx=(10, 0), pady=(2, 0))
+        Tooltip(songsterr_box, "Search Songsterr's tabs for any song. Downloading one turns its drum tab into a MIDI.")
         self.search_button = ttk.Button(find, text="Search", style="Accent.TButton", command=self.on_search)
         self.search_button.grid(row=5, column=0, sticky="ew", pady=6)
         result_holder, self.results = scroll_around(find, lambda parent: styled_list(parent))
@@ -1422,6 +1455,8 @@ class Finder:
             sites.append("MIDIfind")
         if self.use_midiworld.get():
             sites.append("MIDIWORLD")
+        if self.use_songsterr.get():
+            sites.append("Songsterr")
         return sites
 
     def set_busy(self, busy: bool) -> None:
@@ -1495,6 +1530,11 @@ class Finder:
             tree.selection_set(kept[0])
         more = f"  ·  {extra} new" if extra else ""
         self.saved_label["text"] = f"Songs  ·  {len(self.songs)} saved{more}"
+        if not self.songs and not extra:
+            tree.insert("", "end", iid="hint:empty", text="No songs yet.", tags=("hint",))
+            tree.insert("", "end", iid="hint:find", text="Use Find online to search", tags=("hint",))
+            tree.insert("", "end", iid="hint:sites", text="Songsterr, MIDIfind, or MIDIWORLD.", tags=("hint",))
+            tree.tag_configure("hint", foreground=MUTED)
 
     def on_saved(self, _event: object = None) -> None:
         selected = self.saved_list.selection()
@@ -1504,6 +1544,11 @@ class Finder:
             self._keep_selection = None
             return
         self._keep_selection = None
+        if selected[0].startswith("hint:"):
+            self.saved_list.selection_set(())
+            self.left_tabs.select(1)
+            self.title.focus_set()
+            return
         path = self.file_by_iid.get(selected[0])
         if path is not None:
             self.open_source(path)
@@ -1926,10 +1971,10 @@ class Finder:
             messagebox.showinfo("Drum MIDI finder", "Enter a song title.")
             return
         if not sites:
-            messagebox.showinfo("Drum MIDI finder", "Choose MIDIfind, MIDIWORLD, or both.")
+            messagebox.showinfo("Drum MIDI finder", "Choose at least one of MIDIfind, MIDIWORLD, and Songsterr.")
             return
         query = " ".join(part for part in (artist, song) if part)
-        site_text = " and ".join(sites)
+        site_text = ", ".join(sites[:-1]) + " and " + sites[-1] if len(sites) > 1 else sites[0]
         if not messagebox.askyesno(
             "Search",
             f'Search {site_text} for "{query}"?\n\nThis sends that title to the sites you checked.',
@@ -1968,10 +2013,14 @@ class Finder:
         if not selection:
             return
         hit = self.hits[selection[0]]
+        what = (
+            f'Download the drum tab for "{hit.title}" from Songsterr, turn it into a MIDI, and suggest loop sections?'
+            if hit.tab is not None
+            else f'Download "{hit.title}" from {hit.site} and suggest loop sections?'
+        )
         if not messagebox.askyesno(
             "Download",
-            f'Download "{hit.title}" from {hit.site} and suggest loop sections?\n\n'
-            "The file is saved in incoming. Nothing is added to the song list until you click Add to song list.",
+            f"{what}\n\nThe file is saved in incoming. Nothing is added to the song list until you click Add to song list.",
         ):
             self.set_status("Download cancelled.")
             return
@@ -1985,9 +2034,9 @@ class Finder:
             error = ""
         except Exception as exc:
             path, error = None, str(exc)
-        self.from_worker(lambda: self.show_download(path, error))
+        self.from_worker(lambda: self.show_download(path, error, hit.tab))
 
-    def show_download(self, path: Path | None, error: str) -> None:
+    def show_download(self, path: Path | None, error: str, tab: songsterr.Tab | None = None) -> None:
         self.set_busy(False)
         if error or path is None:
             self.set_status(error or "The download failed.")
@@ -2002,8 +2051,8 @@ class Finder:
         self.saved_list.selection_set(())
         self.show_file(
             path,
-            self.artist.get().strip() or "Unknown",
-            self.title.get().strip() or path.stem,
+            (tab.artist if tab else self.artist.get().strip()) or "Unknown",
+            (tab.title if tab else self.title.get().strip()) or path.stem,
             idea.divisions,
             editable=True,
             summary=idea.summary,
