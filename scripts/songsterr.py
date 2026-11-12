@@ -10,10 +10,12 @@ from __future__ import annotations
 import gzip
 import json
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
 BROWSER = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -23,6 +25,37 @@ API = "https://www.songsterr.com/api"
 TRACK_HOST = "https://dqsljvtekg760.cloudfront.net"
 DRUM_INSTRUMENT = 1024
 MAX_SHIFT = 24
+PART_KINDS = ("drums", "guitar", "bass")
+
+
+@dataclass
+class Part:
+    index: int
+    kind: str
+    name: str
+    views: int = 0
+
+
+def part_kind(track: dict) -> str:
+    instrument = str(track.get("instrument") or "").lower()
+    prefix = str(track.get("hash") or "").split("_", 1)[0].lower()
+    if track.get("instrumentId") == DRUM_INSTRUMENT or prefix == "drums" or "drum" in instrument:
+        return "drums"
+    if prefix in ("bass", "guitar", "vocals"):
+        return prefix
+    if "bass" in instrument:
+        return "bass"
+    if "guitar" in instrument:
+        return "guitar"
+    return "other"
+
+
+def part_name(name: str) -> str:
+    """'Angus Young | Gibson SG Standard | Lead Guitar' becomes 'Lead Guitar (Angus Young)'."""
+    pieces = [piece.strip() for piece in name.split("|") if piece.strip()]
+    if len(pieces) >= 2:
+        return f"{pieces[-1]} ({pieces[0]})"
+    return pieces[0] if pieces else "Unnamed part"
 
 
 @dataclass
@@ -37,10 +70,20 @@ class Tab:
     sections: list[tuple[int, int, str]] = field(default_factory=list)
     tempos: list[tuple[int, float]] = field(default_factory=list)
     error: str = ""
+    base_url: str = ""
+    parts: list[Part] = field(default_factory=list)
 
     @property
     def count(self) -> int:
         return len(self.bars)
+
+    def part_url(self, index: int) -> str:
+        return f"{self.base_url or self.url}t{index}"
+
+    def best_part(self, kind: str) -> Part | None:
+        """The most viewed part of that kind, which is the one Songsterr opens first."""
+        matches = [part for part in self.parts if part.kind == kind]
+        return max(matches, key=lambda part: part.views) if matches else None
 
     def bar_hits(self) -> list[int]:
         return [bar["hits"] for bar in self.bars]
@@ -74,6 +117,14 @@ def slug(text: str) -> str:
     while "--" in cleaned:
         cleaned = cleaned.replace("--", "-")
     return cleaned.strip("-") or "song"
+
+
+def same_title(left: str, right: str) -> bool:
+    """TNT and T.N.T. are the same title; only letters and digits are compared."""
+    def letters(text: str) -> str:
+        return "".join(char for char in text.lower() if char.isalnum())
+
+    return bool(letters(left)) and letters(left) == letters(right)
 
 
 def _get(url: str, timeout: int = 15) -> bytes:
@@ -123,12 +174,60 @@ def find(artist: str, title: str, with_track: bool = True) -> Tab | None:
             f"Songsterr drum tab · {found_artist} — {found_title}",
             drum_track=drum,
         )
+    tab.base_url = base
+    for index, track in enumerate(tracks):
+        try:
+            views = int(track.get("views") or 0)
+        except (TypeError, ValueError):
+            views = 0
+        tab.parts.append(Part(index, part_kind(track), part_name(str(track.get("name") or track.get("instrument") or "")), views))
     if with_track:
         try:
             load_track(tab)
         except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError) as exc:
             tab.error = f"Songsterr's tab data could not be read ({exc})."
     return tab
+
+
+CACHE_DAYS = 7
+MISS_DAYS = 1
+
+
+def find_cached(artist: str, title: str, folder: Path) -> Tab | None:
+    """find(), remembered on disk so a song is only looked up again after CACHE_DAYS.
+
+    A song Songsterr does not have is remembered for MISS_DAYS. Failed reads are
+    not remembered, so they are retried next time.
+    """
+    path = folder / f"{slug(artist)}--{slug(title)}.json"
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        age_days = (time.time() - float(saved["saved"])) / 86400
+        if saved.get("tab") is None and age_days < MISS_DAYS:
+            return None
+        if saved.get("tab") is not None and age_days < CACHE_DAYS:
+            return _tab_from(saved["tab"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    tab = find(artist, title)
+    if tab is None or not tab.error:
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            data = {"saved": time.time(), "tab": asdict(tab) if tab else None}
+            path.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+        except OSError:
+            pass
+    return tab
+
+
+def _tab_from(data: dict) -> Tab:
+    data = dict(data)
+    data["parts"] = [Part(**part) for part in data.get("parts") or []]
+    data["sections"] = [tuple(item) for item in data.get("sections") or []]
+    data["tempos"] = [tuple(item) for item in data.get("tempos") or []]
+    for bar in data.get("bars") or []:
+        bar["meter"] = tuple(bar["meter"])
+    return Tab(**data)
 
 
 def load_track(tab: Tab) -> None:

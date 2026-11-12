@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import array
 import io
 import math
 import random
+import sys
 import wave
 
 import tkinter as tk
@@ -42,6 +44,8 @@ LANES = (
 CRASHES = {49, 52, 55, 57}
 LANE_HEIGHT = 10
 LANE_GAP = 3
+PLOT_MIN = 72
+PLOT_MAX = 220
 
 
 def bar_lanes(events: list, boundaries: list[int]) -> tuple[list[tuple[int, ...]], set[int]]:
@@ -79,7 +83,7 @@ class SectionChart(ttk.Frame):
         super().__init__(parent)
         self.canvas = tk.Canvas(
             self,
-            height=248,
+            height=200,
             bg=CHART_BG,
             highlightthickness=0,
             xscrollcommand=self._on_scroll,
@@ -125,11 +129,39 @@ class SectionChart(ttk.Frame):
         self.canvas.bind("<ButtonPress-3>", self._insert_press)
         self.canvas.bind("<B3-Motion>", self._insert_motion)
         self.canvas.bind("<ButtonRelease-3>", self._insert_release)
-        self.name_font = tkfont.Font(self.canvas, family="Segoe UI", size=11, weight="bold")
-        self.bar_font = tkfont.Font(self.canvas, family="Segoe UI", size=10)
-        self.axis_font = tkfont.Font(self.canvas, family="Segoe UI", size=10)
-        self.axis_bold = tkfont.Font(self.canvas, family="Segoe UI", size=10, weight="bold")
-        self.lane_font = tkfont.Font(self.canvas, family="Segoe UI", size=9, weight="bold")
+        self.name_font = tkfont.Font(self.canvas, family="Segoe UI", size=10, weight="bold")
+        self.bar_font = tkfont.Font(self.canvas, family="Segoe UI", size=9)
+        self.axis_font = tkfont.Font(self.canvas, family="Segoe UI", size=9)
+        self.axis_bold = tkfont.Font(self.canvas, family="Segoe UI", size=9, weight="bold")
+        self.lane_font = tkfont.Font(self.canvas, family="Segoe UI", size=8, weight="bold")
+        self._font_sizes = [(font, int(font.cget("size"))) for font in
+                            (self.name_font, self.bar_font, self.axis_font, self.axis_bold, self.lane_font)]
+        self.lane_height = LANE_HEIGHT
+        self._base = 18
+        self._span = 94
+        self._drawn_height = 0
+        self._redraw_job: str | None = None
+        self.canvas.bind("<Configure>", self._on_resize)
+
+    def set_scale(self, scale: float) -> None:
+        """Grow or shrink the chart text; rows and lanes follow the text size."""
+        for font, size in self._font_sizes:
+            font.configure(size=max(6, round(size * scale)))
+        self.lane_height = max(7, round(LANE_HEIGHT * scale))
+        self._redraw()
+
+    def _on_resize(self, event: tk.Event) -> None:
+        if self._hits and abs(event.height - self._drawn_height) > 3:
+            if self._redraw_job is not None:
+                self.after_cancel(self._redraw_job)
+            self._redraw_job = self.after(40, self._redraw)
+
+    def _redraw(self) -> None:
+        self._redraw_job = None
+        if self._hits:
+            fraction = self.canvas.canvasx(0) / max(1, self.full_width)
+            self.draw(self._hits, self._divisions, self._parts, self._lanes, self._crashes, self._meters)
+            self.canvas.xview_moveto(fraction)
 
     def _on_scroll(self, first: str, last: str) -> None:
         self.bar.set(first, last)
@@ -398,26 +430,39 @@ class SectionChart(ttk.Frame):
         part_rows = self._assign_rows(part_labels)
         rc_rows = self._assign_rows(rc_labels)
         axis_rows = self._assign_rows(axis_labels)
-        part_stride = 42
-        rc_stride = 24
-        axis_stride = 20
-        part_bottom = 14 + max(part_rows, 1) * part_stride
+        name_h = self.name_font.metrics("linespace")
+        bar_h = self.bar_font.metrics("linespace")
+        axis_h = self.axis_font.metrics("linespace")
+        meter_h = self.axis_bold.metrics("linespace")
+        part_stride = name_h + bar_h + 5
+        rc_stride = name_h + 4
+        axis_stride = axis_h + 2
+        first_row = round(name_h * 0.7)
+        part_bottom = first_row + max(part_rows, 1) * part_stride
         rc_top = part_bottom + 2
         meter_row = rc_top + max(rc_rows, 1) * rc_stride + 4
-        self.plot_top = meter_row + 16
-        self.plot_bottom = self.plot_top + 120
-        lane_top = self.plot_bottom + 5
+        self.plot_top = meter_row + meter_h - 1
         lane_rows = len(LANES) if self._lanes else 0
-        axis_top = lane_top + lane_rows * (LANE_HEIGHT + LANE_GAP) + 6
+        lane_step = self.lane_height + LANE_GAP
+        below = 5 + lane_rows * lane_step + 6 + max(axis_rows, 1) * axis_stride + 8
+        room = self.canvas.winfo_height()
+        plot_h = max(PLOT_MIN, min(PLOT_MAX, room - self.plot_top - below)) if room > 50 else PLOT_MIN
+        self._drawn_height = room
+        self.plot_bottom = self.plot_top + plot_h
+        lane_top = self.plot_bottom + 5
+        axis_top = lane_top + lane_rows * lane_step + 6
         content = axis_top + max(axis_rows, 1) * axis_stride + 8
         self._content = content
-        self.canvas.configure(height=max(248, content), scrollregion=(0, 0, self.full_width, content))
+        self.canvas.configure(height=self.plot_top + PLOT_MIN + below, scrollregion=(0, 0, self.full_width, content))
+        self._base = round(plot_h * 0.15)
+        self._span = plot_h - self._base - max(18, round(plot_h * 0.2))
         self._draw_grid(len(hits), peak, meter_row)
-        self.canvas.create_text(8, self.plot_top + 4, text=str(peak), fill=MUTED, anchor="w", font=self.axis_font)
+        peak_y = self.plot_bottom - self._base - self._span
+        self.canvas.create_text(8, peak_y, text=str(peak), fill=MUTED, anchor="w", font=self.axis_font)
         self.canvas.create_line(self.pad, self.plot_bottom, self.full_width - 12, self.plot_bottom, fill="#3a404d")
         for bar, count_hits in enumerate(hits, start=1):
             role = roles[bar - 1]
-            column = 18 if count_hits == 0 else 18 + round(count_hits / peak * 94)
+            column = self._base if count_hits == 0 else self._base + round(count_hits / peak * self._span)
             x = self.pad + (bar - 1) * self.step
             y = self.plot_bottom - column
             self.canvas.create_rectangle(x, y, x + self.bar_w, self.plot_bottom, fill=ROLE[role], width=0)
@@ -438,20 +483,20 @@ class SectionChart(ttk.Frame):
         if self._lanes:
             peaks = [max((row[lane] for row in self._lanes), default=0) or 1 for lane in range(len(LANES))]
             for lane, (short, _name, _notes, color) in enumerate(LANES):
-                top = lane_top + lane * (LANE_HEIGHT + LANE_GAP)
-                self.canvas.create_text(10, top + LANE_HEIGHT / 2, text=short, fill=color, anchor="w", font=self.lane_font)
+                top = lane_top + lane * lane_step
+                self.canvas.create_text(10, top + self.lane_height / 2, text=short, fill=color, anchor="w", font=self.lane_font)
                 for bar, row in enumerate(self._lanes[: len(hits)], start=1):
                     value = row[lane]
                     x = self.pad + (bar - 1) * self.step
                     fill = _blend(color, 0.12) if value == 0 else _blend(color, 0.3 + 0.7 * value / peaks[lane])
-                    self.canvas.create_rectangle(x, top, x + self.bar_w, top + LANE_HEIGHT, fill=fill, width=0, tags="lane")
+                    self.canvas.create_rectangle(x, top, x + self.bar_w, top + self.lane_height, fill=fill, width=0, tags="lane")
         for bar in section_starts:
             x = self.pad + (bar - 1) * self.step
             self.canvas.create_line(x, self.plot_top, x, self.plot_bottom, fill=INK, width=1)
         for label in part_labels:
-            y = 14 + label["row"] * part_stride
+            y = first_row + label["row"] * part_stride
             self.canvas.create_text(label["x"], y, text=label["text"], fill="#e6d3a8", anchor="w", font=self.name_font)
-            self.canvas.create_text(label["x"], y + 20, text=label["bar"], fill="#d9c79d", anchor="w", font=self.bar_font)
+            self.canvas.create_text(label["x"], y + (name_h + bar_h) / 2 + 1, text=label["bar"], fill="#d9c79d", anchor="w", font=self.bar_font)
         for label in rc_labels:
             y = rc_top + label["row"] * rc_stride
             self.canvas.create_text(label["x"], y, text=label["text"], fill=label["fill"], anchor="w", font=self.name_font)
@@ -487,7 +532,7 @@ class SectionChart(ttk.Frame):
         top, bottom = self.plot_top, self.plot_bottom
         self.canvas.create_rectangle(left, top, right, bottom, fill=GRID_BG, width=0, tags="grid")
         for share in (0.25, 0.5, 0.75, 1.0):
-            y = bottom - (18 + share * 94)
+            y = bottom - (self._base + share * self._span)
             self.canvas.create_line(left, y, right, y, fill=GRID_LEVEL, tags="grid")
         beat_room = self.bar_w >= 12
         phrase_start = 1
@@ -503,7 +548,7 @@ class SectionChart(ttk.Frame):
                 text = f"{meter[0]}/{meter[1]}"
                 if x + 1 > label_end:
                     self.canvas.create_text(
-                        x + 1, meter_row + 7, text=text, fill=GRID_METER_TEXT, anchor="w",
+                        x + 1, meter_row + self.axis_bold.metrics("linespace") / 2 - 1, text=text, fill=GRID_METER_TEXT, anchor="w",
                         font=self.axis_bold, tags="grid",
                     )
                     label_end = x + 1 + self.axis_bold.measure(text) + 6
@@ -568,8 +613,7 @@ def _noise(mix: list[float], pos: int, length: int, peak: float, rng: random.Ran
         mix[pos + index] += rng.uniform(-1, 1) * peak * fade
 
 
-def _hit(mix: list[float], pos: int, note: int, velocity: int, rng: random.Random) -> None:
-    level = max(0.15, velocity / 127)
+def _hit(mix: list[float], pos: int, note: int, level: float, rng: random.Random) -> None:
     samples = RATE
     if note in (35, 36):
         _tone(mix, pos, int(samples * 0.16), 150, 48, 0.9 * level)
@@ -596,21 +640,40 @@ def _hit(mix: list[float], pos: int, note: int, velocity: int, rng: random.Rando
         _tone(mix, pos, int(samples * 0.08), freq, freq, 0.16 * level)
 
 
+_SOUNDS: dict[int, list[float]] = {}
+
+
+def _sound(note: int) -> list[float]:
+    """One full-level hit of a drum note, built once and mixed in at each hit's velocity."""
+    sound = _SOUNDS.get(note)
+    if sound is None:
+        sound = [0.0] * int(RATE * 0.3)
+        _hit(sound, 0, note, 1.0, random.Random(note))
+        end = len(sound)
+        while end and sound[end - 1] == 0.0:
+            end -= 1
+        sound = _SOUNDS[note] = sound[:end]
+    return sound
+
+
 def render_section(events: list[list[int]], start_ms: int, end_ms: int) -> bytes:
     duration = max(0.05, (end_ms - start_ms) / 1000)
     total = int(duration * RATE) + int(0.05 * RATE)
     mix = [0.0] * total
-    rng = random.Random(1)
     for ms, note, velocity in events:
         if ms < start_ms or ms >= end_ms:
             continue
-        _hit(mix, int((ms - start_ms) / 1000 * RATE), note, velocity, rng)
-    peak = max((abs(sample) for sample in mix), default=1.0) or 1.0
+        pos = int((ms - start_ms) / 1000 * RATE)
+        sound = _sound(note)
+        level = max(0.15, velocity / 127)
+        end = min(total, pos + len(sound))
+        mix[pos:end] = [old + new * level for old, new in zip(mix[pos:end], sound)]
+    peak = max(max(mix, default=0.0), -min(mix, default=0.0)) or 1.0
     scale = 28000 / peak
-    pcm = bytearray()
-    for sample in mix:
-        value = max(-32767, min(32767, int(sample * scale)))
-        pcm += int(value).to_bytes(2, "little", signed=True)
+    samples = array.array("h", [int(sample * scale) for sample in mix])
+    if sys.byteorder != "little":
+        samples.byteswap()
+    pcm = samples.tobytes()
     buffer = io.BytesIO()
     with wave.open(buffer, "wb") as handle:
         handle.setnchannels(1)

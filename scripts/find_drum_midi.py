@@ -11,6 +11,7 @@ Run:
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import html
 import http.cookiejar
 import json
@@ -29,7 +30,9 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 from tkinter import filedialog, messagebox, ttk
+from tkinter import font as tkfont
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import album_art
@@ -45,7 +48,6 @@ ROOT = Path(__file__).resolve().parents[1]
 ARTWORK = ROOT / "artwork"
 ICON = ROOT / "assets" / "drum-finder.ico"
 INCOMING = ROOT / "incoming"
-SITES = ("MIDIfind", "MIDIWORLD")
 ALLOWED_HOSTS = {"midifind.com", "www.midifind.com", "midiworld.com", "www.midiworld.com"}
 BROWSER = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -63,9 +65,21 @@ HOVER = "#2c313c"
 ACCENT_HOVER = "#f0b35c"
 DISABLED = "#2a2d34"
 DISABLED_TEXT = "#8a867e"
-UI_FONT = ("Segoe UI", 11)
-TITLE_FONT = ("Segoe UI", 18)
-REPORT_FONT = ("Cascadia Mono", 11)
+UI_FONT = "FinderUI"
+TITLE_FONT = "FinderTitle"
+REPORT_FONT = "FinderMono"
+SECTION_FONT = "FinderSection"
+SONG_FONT = "FinderSong"
+SMALL_FONT = "FinderSmall"
+FONT_SPECS = {
+    UI_FONT: ("Segoe UI", 10, "normal"),
+    TITLE_FONT: ("Segoe UI", 14, "normal"),
+    REPORT_FONT: ("Cascadia Mono", 10, "normal"),
+    SECTION_FONT: ("Segoe UI", 9, "normal"),
+    SONG_FONT: ("Segoe UI", 14, "normal"),
+    SMALL_FONT: ("Segoe UI", 9, "normal"),
+}
+TEXT_SCALES = (80, 150)
 
 DIVISIONS = (
     ("intro", "Intro", False),
@@ -84,18 +98,6 @@ class Hit:
     page_url: str
     download_url: str
     more: bool = False
-
-
-@dataclass
-class KitInfo:
-    measures: int
-    kit_notes: int
-    tempo: str
-    meter: str
-    kit_names: list[str]
-    tracks: list[str]
-    preview: str
-    notes: list[str]
 
 
 class Web:
@@ -291,11 +293,6 @@ def resume_preview() -> None:
     audio_command("resume drum")
 
 
-def restart_preview() -> None:
-    audio_command("seek drum to start")
-    audio_command("play drum")
-
-
 def close_preview() -> None:
     audio_command("stop drum", optional=True)
     audio_command("close drum", optional=True)
@@ -303,20 +300,119 @@ def close_preview() -> None:
 
 RHYTHM_CONVERTER = Path(r"C:\Program Files (x86)\BOSS\RC-10R Rhythm Converter\RC-10R Rhythm Converter.exe")
 EXPORTS = ROOT / "exports"
+SETTINGS_PATH = Path(os.environ.get("APPDATA") or ROOT) / "MidiTool" / "finder-settings.json"
+# Caches stay on this computer, out of OneDrive.
+LOCAL_DATA = Path(os.environ.get("LOCALAPPDATA") or ROOT) / "MidiTool"
+SONGSTERR_CACHE = LOCAL_DATA / "songsterr"
+PREVIEWS = LOCAL_DATA / "previews"
+KEEP_PREVIEWS = 4
+KEEP_SESSIONS = 20
+MIDI_SUFFIXES = {".mid", ".midi", ".kar"}
+COVER_SIZE = 88
+PART_NOUNS = {"drums": "drum", "guitar": "guitar", "bass": "bass"}
+SCAN_MS = 4000
 HISTORY_LIMIT = 200
+# Undo steps that do not change the saved MIDI, so they leave nothing unsaved.
+LINEUP_LABELS = {"move the Songsterr line-up", "line up Songsterr"}
+
+
+def load_settings() -> dict:
+    try:
+        settings = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return settings if isinstance(settings, dict) else {}
+
+
+def save_settings(settings: dict) -> None:
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SETTINGS_PATH.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+
+
+def clean_name(text: str) -> str:
+    """Drop download-site tags, copy numbers and underscores from a file name."""
+    text = text.replace("_", " ")
+    text = re.sub(r"\[[^\]]*\]", "", text)
+    text = re.sub(r"\((?:\d+|RC-10R[^)]*|drums?)\)", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+drums?\s*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^(.*?)\s*\(The\)", r"The \1", text.strip(), flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", text).strip(" -—")
 
 
 def guess_artist_title(path: Path) -> tuple[str, str]:
     """Artist and title from "Artist - Title.mid", or from an artist folder above the file."""
-    stem = re.sub(r"\s*\((?:RC-10R[^)]*|drums?)\)\s*$", "", path.stem, flags=re.IGNORECASE)
-    stem = re.sub(r"\s+drums?$", "", stem, flags=re.IGNORECASE).replace("_", " ").strip()
-    if " - " in stem:
-        artist, title = stem.split(" - ", 1)
-        return artist.strip(), title.strip()
+    stem = clean_name(path.stem)
+    parts = re.split(r"\s+[-—–]\s+", stem, maxsplit=1)
+    if len(parts) == 2:
+        return clean_name(parts[0]), clean_name(parts[1])
     parent = path.parent
     if parent.parent.name.casefold() == "artists":
         return parent.name, stem
     return "", stem
+
+
+def work_area() -> tuple[int, int, int, int]:
+    """Left, top, width and height of the desktop area not covered by the taskbar."""
+    rect = (ctypes.c_long * 4)()
+    if ctypes.windll.user32.SystemParametersInfoW(0x30, 0, ctypes.byref(rect), 0):  # SPI_GETWORKAREA
+        return rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1]
+    return 0, 0, 1280, 720
+
+
+def start_geometry(saved: str) -> str:
+    """The last window size and place if it still fits on screen, else a compact window."""
+    left, top, width, height = work_area()
+    found = re.fullmatch(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", saved or "")
+    if found:
+        w, h, x, y = map(int, found.groups())
+        if w <= width and h <= height - 30 and left <= x <= left + width - 200 and top <= y <= top + height - 100:
+            return saved
+    w = min(1240, width - 40)
+    h = min(820, height - 40)
+    return f"{w}x{h}+{left + (width - w) // 2}+{top + max(0, (height - h - 30) // 2)}"
+
+
+def brief_meters(text: str, keep: int = 3) -> str:
+    """The first few meters of a list like "4/4, 3/4 at bar 20, …", with a count of the rest."""
+    parts = text.split(", ")
+    if len(parts) <= keep:
+        return text
+    return ", ".join(parts[:keep]) + f" and {len(parts) - keep} more meter changes"
+
+
+def short_path(path: Path) -> str:
+    parts = path.parts
+    return str(path) if len(parts) <= 3 else "…\\" + "\\".join(parts[-2:])
+
+
+def artist_key(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.casefold())
+
+
+def same_file(a: Path, b: Path) -> bool:
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def scan_midi(folder: Path) -> list[Path]:
+    """Every MIDI file under a folder, sorted by path."""
+    found = []
+    for base, _dirs, names in os.walk(folder):
+        found.extend(Path(base) / name for name in names if Path(name).suffix.casefold() in MIDI_SUFFIXES)
+    return sorted(found, key=lambda path: str(path).casefold())
+
+
+def source_artist(path: Path, folder: Path, known: dict[str, str]) -> str:
+    """The artist a source file belongs under: a saved artist if the folder or file name matches one."""
+    artist, _title = guess_artist_title(path)
+    try:
+        relative = path.relative_to(folder)
+        folder_name = relative.parts[0] if len(relative.parts) > 1 else ""
+    except ValueError:
+        folder_name = ""
+    for name in (folder_name, artist):
+        if name and artist_key(name) in known:
+            return known[artist_key(name)]
+    return folder_name or artist or "Other files"
 
 
 class _FileOp(ctypes.Structure):
@@ -343,10 +439,41 @@ def to_recycle_bin(path: Path) -> None:
         raise OSError(f"Windows could not move {path.name} to the Recycle Bin (code {result}).")
 
 
+def session_key(path: Path, editable: bool) -> str:
+    name = hashlib.md5(os.path.normcase(str(path)).encode("utf-8")).hexdigest()[:12]
+    return f"{'edit' if editable else 'saved'}-{name}"
+
+
+def file_stamp(path: Path) -> int | None:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def preview_path(key: str, generation: int) -> Path:
+    return PREVIEWS / f"{key}-{generation}.wav"
+
+
+def clear_previews(keep: set[Path] | None = None) -> None:
+    """Delete preview wavs, except the ones in keep. Old INCOMING previews are swept too."""
+    keep = keep or set()
+    for folder, pattern in ((PREVIEWS, "*.wav"), (INCOMING, "preview-*.wav")):
+        if not folder.is_dir():
+            continue
+        for path in folder.glob(pattern):
+            if path in keep:
+                continue
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
 def lookup_songsterr(artist: str, title: str) -> tuple[songsterr.Tab | None, str]:
     """The Songsterr tab with its sections, or None and a reason."""
     try:
-        return songsterr.find(artist, title), ""
+        return songsterr.find_cached(artist, title, SONGSTERR_CACHE), ""
     except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError) as exc:
         return None, f"Songsterr could not be reached ({exc})."
 
@@ -441,9 +568,10 @@ def unique_path(path: Path) -> Path:
         number += 1
 
 
-def read_kit(path: Path) -> KitInfo:
+def file_notes(path: Path) -> list[str]:
+    """Warnings about the file, saved with the song in the song list."""
     midi = chart.parse_midi(path)
-    bar_hits, meters, _boundaries = chart.build_measures(midi)
+    _bar_hits, meters, _boundaries = chart.build_measures(midi)
     kit_named = [track for track in midi["tracks"] if chart.is_kit_track(track["name"])]
     notes: list[str] = []
     tempos = [us for _tick, us in midi["tempos"] if us]
@@ -458,49 +586,7 @@ def read_kit(path: Path) -> KitInfo:
         notes.append("No track is named drum. Channel 10 was counted, the same way as the charts.")
     if not midi["events"]:
         notes.append("This file has no drum-kit notes.")
-    tracks: list[str] = []
-    for track in midi["tracks"]:
-        if not track["notes"]:
-            continue
-        name = track["name"] or "(unnamed)"
-        channels = ", ".join(str(channel + 1) for channel in track["channels"]) or "none"
-        mark = "kit" if chart.is_kit_track(track["name"]) else "not the kit"
-        tracks.append(f"  {name}: {track['notes']} notes, channels {channels}, {mark}")
-    preview = " ".join(str(count) for count in bar_hits[:24])
-    if len(bar_hits) > 24:
-        preview += f" … {len(bar_hits)} bars"
-    return KitInfo(
-        measures=len(bar_hits),
-        kit_notes=len(midi["events"]),
-        tempo=chart.tempo_text(midi["tempos"]),
-        meter=chart.meter_text(meters),
-        kit_names=[track["name"] or "(unnamed)" for track in kit_named],
-        tracks=tracks,
-        preview=preview or "(none)",
-        notes=notes,
-    )
-
-
-def describe(path: Path, hit: Hit) -> str:
-    info = read_kit(path)
-    lines = [
-        f"{hit.site}: {hit.title}",
-        f"Saved: {path}",
-        f"{info.tempo} · {info.meter} · {info.measures} measures",
-        f"Drum-kit notes: {info.kit_notes}",
-    ]
-    if info.kit_names:
-        lines.append("Kit track: " + ", ".join(info.kit_names))
-    lines.extend(info.notes)
-    lines.extend(["", "Tracks", *info.tracks, "", "Kit hits by bar", info.preview])
-    lines.extend(
-        [
-            "",
-            "Click Add to chart when you know the intro, pattern, and ending bars.",
-            "That copies this file into the drum folder, adds it to the song list, and rebuilds the chart.",
-        ]
-    )
-    return "\n".join(lines)
+    return notes
 
 
 def parse_length(start_text: str, length_text: str, label: str) -> tuple[int, int]:
@@ -570,6 +656,11 @@ def song_entry(
 def place_midi(src: Path, artist: str, drum_root: Path) -> tuple[str, Path, bool]:
     if not src.is_file():
         raise ValueError(f"The downloaded file is missing: {src}")
+    try:
+        relative = src.resolve().relative_to(drum_root.resolve()).as_posix()
+        return relative, src, False
+    except ValueError:
+        pass
     folder = artist_dir(drum_root, artist)
     folder.mkdir(parents=True, exist_ok=True)
     filename = safe_name(src.name, "download.mid")
@@ -582,28 +673,14 @@ def place_midi(src: Path, artist: str, drum_root: Path) -> tuple[str, Path, bool
     return relative, dest, created
 
 
-def rebuild_chart(catalog_path: Path, chart_path: Path) -> None:
-    catalog = load_catalog(catalog_path)
-    root = Path(catalog["drumRoot"])
-    blocks = []
-    for song in catalog["songs"]:
-        path = root / song["file"]
-        if not path.is_file():
-            raise ValueError(f"Missing MIDI file: {path}")
-        blocks.append(chart.render_song(song, path))
-    chart_path.parent.mkdir(parents=True, exist_ok=True)
-    chart_path.write_text(chart.render_page(catalog, "\n".join(blocks)), encoding="utf-8")
-
-
 def add_to_list(
     src: Path,
     artist: str,
     title: str,
     divisions: dict[str, list[int]],
-    extra_note: str,
+    extra_note: str = "",
     *,
     catalog_path: Path = chart.MAP_PATH,
-    chart_path: Path = chart.OUT_PATH,
     drum_root: Path | None = None,
 ) -> str:
     artist = artist.strip()
@@ -613,14 +690,13 @@ def add_to_list(
     slug = song_id(title)
     if slug in chart.EXPECTED:
         raise ValueError(
-            f"{title} is already on the chart with fixed ranges. This finder will not replace it."
+            f"{title} is already in the song list with fixed ranges. This finder will not replace it."
         )
     previous = catalog_path.read_bytes()
     catalog = json.loads(previous.decode("utf-8"))
-    root = drum_root or Path(catalog["drumRoot"])
-    info = read_kit(src)
+    root = drum_root or chart.drum_root(catalog)
+    notes = file_notes(src)
     relative, dest, created = place_midi(src, artist, root)
-    notes = list(info.notes)
     if extra_note.strip():
         notes.append(extra_note.strip())
     entry = song_entry(artist, title, relative, divisions, notes)
@@ -634,7 +710,6 @@ def add_to_list(
         catalog["songs"].append(entry)
     try:
         write_catalog(catalog_path, catalog)
-        rebuild_chart(catalog_path, chart_path)
     except Exception:
         catalog_path.write_bytes(previous)
         if created and dest.exists():
@@ -642,13 +717,30 @@ def add_to_list(
         raise
     verb = "Replaced" if replaced else "Added"
     return (
-        f"{verb} {artist} — {title} on the chart.\n"
+        f"{verb} {artist} — {title} in the song list.\n"
         f"File: {dest}\n"
         + "\n".join(typing_lines(divisions))
     )
 
 
+_FONTS: dict[str, tkfont.Font] = {}
+
+
+def make_fonts(root: tk.Misc) -> None:
+    for name, (family, size, weight) in FONT_SPECS.items():
+        _FONTS[name] = tkfont.Font(root, name=name, family=family, size=size, weight=weight)
+
+
+def scale_fonts(root: tk.Misc, scale: float) -> None:
+    """Resize every named finder font; widgets using them follow on their own."""
+    for name, (_family, size, _weight) in FONT_SPECS.items():
+        _FONTS[name].configure(size=max(7, round(size * scale)))
+    line = _FONTS[UI_FONT].metrics("linespace")
+    ttk.Style(root).configure("Songs.Treeview", rowheight=line + 8)
+
+
 def apply_theme(root: tk.Tk) -> None:
+    make_fonts(root)
     style = ttk.Style(root)
     style.theme_use("clam")
     style.configure(".", background=INK, foreground=TEXT, font=UI_FONT)
@@ -656,8 +748,36 @@ def apply_theme(root: tk.Tk) -> None:
     style.configure("TLabel", background=INK, foreground=TEXT)
     style.configure("Title.TLabel", font=TITLE_FONT, background=INK, foreground=TEXT)
     style.configure("Muted.TLabel", background=INK, foreground=MUTED)
-    style.configure("Section.TLabel", background=INK, foreground=MUTED, font=("Segoe UI", 10))
-    style.configure("Song.TLabel", background=INK, foreground=TEXT, font=("Segoe UI", 16))
+    style.configure("Section.TLabel", background=INK, foreground=MUTED, font=SECTION_FONT)
+    style.configure("Song.TLabel", background=INK, foreground=TEXT, font=SONG_FONT)
+    style.configure("Kit.TLabel", background=INK, foreground=ACCENT, font=UI_FONT)
+    style.configure("TNotebook", background=INK, borderwidth=0, tabmargins=(0, 0, 0, 0))
+    style.configure(
+        "TNotebook.Tab",
+        background=PANEL,
+        foreground=MUTED,
+        padding=(14, 5),
+        borderwidth=0,
+        lightcolor=INK,
+        bordercolor=INK,
+        font=UI_FONT,
+    )
+    style.map(
+        "TNotebook.Tab",
+        background=[("selected", FIELD), ("active", HOVER)],
+        foreground=[("selected", TEXT)],
+        lightcolor=[("selected", FIELD)],
+    )
+    style.configure(
+        "Horizontal.TScale",
+        background="#9aa0ad",
+        troughcolor=FIELD,
+        bordercolor=INK,
+        lightcolor=PANEL,
+        darkcolor=PANEL,
+        sliderthickness=14,
+    )
+    style.map("Horizontal.TScale", background=[("active", ACCENT)])
     style.configure(
         "TEntry",
         fieldbackground=FIELD,
@@ -666,7 +786,7 @@ def apply_theme(root: tk.Tk) -> None:
         lightcolor=LINE,
         darkcolor=LINE,
         insertcolor=TEXT,
-        padding=8,
+        padding=(6, 4),
         relief="flat",
     )
     style.map(
@@ -684,7 +804,7 @@ def apply_theme(root: tk.Tk) -> None:
         borderwidth=0,
         focusthickness=0,
         focuscolor=INK,
-        padding=(14, 8),
+        padding=(12, 5),
         relief="flat",
     )
     style.map(
@@ -699,15 +819,30 @@ def apply_theme(root: tk.Tk) -> None:
         borderwidth=0,
         focusthickness=0,
         focuscolor=INK,
-        padding=(16, 8),
+        padding=(14, 5),
     )
     style.map(
         "Accent.TButton",
         background=[("active", ACCENT_HOVER), ("disabled", "#3a342c")],
         foreground=[("disabled", "#7a7268")],
     )
-    style.configure("Small.TButton", padding=(10, 5), width=-3)
-    style.configure("SmallAccent.TButton", background=ACCENT, foreground=ACCENT_INK, padding=(10, 5), width=-3)
+    style.configure(
+        "Menu.TMenubutton",
+        background=PANEL,
+        foreground=TEXT,
+        arrowsize=0,
+        borderwidth=0,
+        relief="flat",
+        padding=(10, 4),
+        width=-2,
+        font=UI_FONT,
+    )
+    style.layout("Menu.TMenubutton", [("Menubutton.border", {"sticky": "nswe", "children": [
+        ("Menubutton.padding", {"sticky": "nswe", "children": [("Menubutton.label", {"sticky": "nswe"})]})
+    ]})])
+    style.map("Menu.TMenubutton", background=[("active", HOVER), ("pressed", HOVER)])
+    style.configure("Small.TButton", padding=(10, 4), width=-3)
+    style.configure("SmallAccent.TButton", background=ACCENT, foreground=ACCENT_INK, padding=(10, 4), width=-3)
     style.map(
         "SmallAccent.TButton",
         background=[("active", ACCENT_HOVER), ("disabled", "#3a342c")],
@@ -777,27 +912,6 @@ def dark_titlebar(window: tk.Misc) -> None:
         return
 
 
-def styled_text(parent: tk.Misc, height: int) -> tk.Text:
-    return tk.Text(
-        parent,
-        height=height,
-        wrap="word",
-        font=REPORT_FONT,
-        bg=FIELD,
-        fg=TEXT,
-        insertbackground=TEXT,
-        selectbackground="#3a4254",
-        selectforeground=TEXT,
-        relief="flat",
-        borderwidth=0,
-        highlightthickness=1,
-        highlightbackground=LINE,
-        highlightcolor=ACCENT,
-        padx=12,
-        pady=10,
-    )
-
-
 def styled_list(parent: tk.Misc) -> tk.Listbox:
     return tk.Listbox(
         parent,
@@ -835,6 +949,178 @@ def scroll_around(parent: tk.Misc, build) -> tuple[ttk.Frame, tk.Misc]:
     return holder, widget
 
 
+class Tooltip:
+    """Text that appears when the pointer rests on a widget."""
+
+    def __init__(self, widget: tk.Misc, text: str = "") -> None:
+        self.widget = widget
+        self.text = text
+        self.tip: tk.Toplevel | None = None
+        self.job: str | None = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def __setitem__(self, key: str, value: str) -> None:
+        self.text = value
+
+    def __getitem__(self, key: str) -> str:
+        return self.text
+
+    def _schedule(self, _event: object = None) -> None:
+        self._hide()
+        if self.text:
+            self.job = self.widget.after(450, self._show)
+
+    def _show(self) -> None:
+        self.job = None
+        if not self.text or not self.widget.winfo_viewable():
+            return
+        tip = tk.Toplevel(self.widget)
+        tip.wm_overrideredirect(True)
+        tip.attributes("-topmost", True)
+        tk.Label(
+            tip, text=self.text, bg="#2a2f3a", fg=TEXT, font=SMALL_FONT, justify="left",
+            wraplength=440, padx=10, pady=6, relief="solid", bd=1,
+        ).pack()
+        x = self.widget.winfo_rootx() + 6
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        tip.wm_geometry(f"+{x}+{y}")
+        self.tip = tip
+
+    def _hide(self, _event: object = None) -> None:
+        if self.job is not None:
+            self.widget.after_cancel(self.job)
+            self.job = None
+        if self.tip is not None:
+            self.tip.destroy()
+            self.tip = None
+
+
+class MenuEntry:
+    """A menu item that is enabled, disabled, and relabelled the way a button is."""
+
+    def __init__(self, places: list[tuple[tk.Menu, int]], prefix: str = "") -> None:
+        self.places = places
+        self.prefix = prefix
+        menu, index = places[0]
+        self.text = menu.entrycget(index, "label")[len(prefix):]
+
+    def configure(self, state: str | None = None, text: str | None = None, **_ignored: object) -> None:
+        for menu, index in self.places:
+            if state is not None:
+                menu.entryconfigure(index, state=state)
+            if text is not None:
+                menu.entryconfigure(index, label=self.prefix + (text or "—"))
+        if text is not None:
+            self.text = text
+
+    config = configure
+
+    def __setitem__(self, key: str, value: str) -> None:
+        self.configure(**{key: value})
+
+    def __getitem__(self, key: str) -> str:
+        if key == "text":
+            return self.text
+        menu, index = self.places[0]
+        return str(menu.entrycget(index, key))
+
+
+class Flow(ttk.Frame):
+    """Children laid out left to right, wrapping onto more rows when the frame is narrow."""
+
+    def __init__(self, parent: tk.Misc, gap: int = 6, row_gap: int = 4) -> None:
+        super().__init__(parent, width=200, height=30)
+        self.items: list[tuple[tk.Misc, int]] = []
+        self.gap = gap
+        self.row_gap = row_gap
+        self._job: str | None = None
+        self.bind("<Configure>", lambda _event: self.relayout_soon())
+
+    def add(self, widget: tk.Misc, space: int = 0) -> tk.Misc:
+        self.items.append((widget, space))
+        widget.bind("<Configure>", lambda _event: self.relayout_soon(), add="+")
+        self.relayout_soon()
+        return widget
+
+    def relayout_soon(self) -> None:
+        if self._job is None:
+            self._job = self.after_idle(self.relayout)
+
+    def relayout(self) -> None:
+        self._job = None
+        width = max(self.winfo_width(), 200)
+        rows: list[list[tuple[tk.Misc, int, int, int]]] = [[]]
+        x = 0
+        for widget, space in self.items:
+            w, h = widget.winfo_reqwidth(), widget.winfo_reqheight()
+            lead = self.gap + space if x else 0
+            if x and x + lead + w > width:
+                rows.append([])
+                x, lead = 0, 0
+            rows[-1].append((widget, x + lead, w, h))
+            x += lead + w
+        y = 0
+        for row in rows:
+            tall = max((h for _w, _x, _width, h in row), default=0)
+            for widget, left, _width, h in row:
+                widget.place(x=left, y=y + (tall - h) // 2)
+            y += tall + self.row_gap
+        height = max(1, y - self.row_gap)
+        if int(self.cget("height")) != height:
+            self.configure(height=height)
+
+
+class ScrollArea(ttk.Frame):
+    """Fills the space it is given, and scrolls when what is inside is taller."""
+
+    def __init__(self, parent: tk.Misc) -> None:
+        super().__init__(parent)
+        self.canvas = tk.Canvas(self, bg=INK, highlightthickness=0, bd=0, width=200, height=200)
+        self.bar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview, style="Dark.Vertical.TScrollbar")
+        self.canvas.configure(yscrollcommand=self.bar.set)
+        self.inner = ttk.Frame(self.canvas)
+        self.item = self.canvas.create_window(0, 0, window=self.inner, anchor="nw")
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        self.showing = False
+        self._size = (0, 0)
+        self.canvas.bind("<Configure>", lambda _event: self.fit())
+        self._poll()
+
+    def _poll(self) -> None:
+        self.fit()
+        self.after(200, self._poll)
+
+    def fit(self) -> None:
+        width, height = self.canvas.winfo_width(), self.canvas.winfo_height()
+        if width < 2:
+            return
+        need = self.inner.winfo_reqheight()
+        tall = need > height + 1
+        if tall != self.showing:
+            self.showing = tall
+            if tall:
+                self.bar.grid(row=0, column=1, sticky="ns", padx=(4, 0))
+            else:
+                self.bar.grid_remove()
+                self.canvas.yview_moveto(0)
+        size = (width, max(height, need))
+        if size != self._size:
+            self._size = size
+            self.canvas.itemconfigure(self.item, width=size[0], height=size[1])
+            self.canvas.configure(scrollregion=(0, 0, size[0], size[1]))
+
+    def contains(self, widget: tk.Misc | None) -> bool:
+        return widget is not None and str(widget).startswith(str(self.canvas))
+
+    def scroll(self, units: int) -> None:
+        if self.showing:
+            self.canvas.yview_scroll(units, "units")
+
+
 class Finder:
     def __init__(self) -> None:
         try:
@@ -845,8 +1131,9 @@ class Finder:
         self.root.title("Drum MIDI finder")
         if ICON.is_file():
             self.root.iconbitmap(default=str(ICON))
-        self.root.geometry("1340x1140")
-        self.root.minsize(1160, 900)
+        self.settings = load_settings()
+        self.root.geometry(start_geometry(self.settings.get("geometry", "")))
+        self.root.minsize(860, 520)
         self.root.configure(bg=INK)
         apply_theme(self.root)
         dark_titlebar(self.root)
@@ -865,8 +1152,10 @@ class Finder:
         self.selection: tuple[int, int] | None = None
         self.loop_on = tk.BooleanVar(value=False)
         self.songsterr_token = 0
-        self.songsterr_url = ""
-        self.songsterr_queue: queue.Queue[tuple[int, songsterr.Tab | None, str, str, str]] = queue.Queue()
+        self.songsterr_search = ""
+        self.link_tab: songsterr.Tab | None = None
+        self.songsterr_queue: queue.Queue[tuple[int, songsterr.Tab | None, str]] = queue.Queue()
+        self.worker_calls: queue.Queue[Callable[[], None]] = queue.Queue()
         self.tab: songsterr.Tab | None = None
         self.show_tab_parts = tk.BooleanVar(value=True)
         self.undo_stack: list[dict] = []
@@ -885,6 +1174,8 @@ class Finder:
         self.loop_bars = tk.StringVar()
         self._selecting = False
         self.rendered_generation: int | None = None
+        self.sessions: dict[str, dict] = {}
+        clear_previews()
         self.device_open = False
         self.pending_start: tuple[int, str, tuple[int, int] | None] | None = None
         self.cover_token = 0
@@ -894,149 +1185,154 @@ class Finder:
         self._loading = False
         self.starts: dict[str, tk.StringVar] = {}
         self.lengths: dict[str, tk.StringVar] = {}
+        self.source_files: list[Path] = []
+        self.file_by_iid: dict[str, Path] = {}
+        self.scan_queue: queue.Queue[tuple[str, list[Path]]] = queue.Queue()
+        self.scanning = False
+        self.dirty = False
+        self.text_scale = tk.IntVar(value=int(round(float(self.settings.get("textScale", 1.0)) * 100)))
+        self._applied_scale: int | None = None
+        self._scale_job: str | None = None
+        self.build_menus()
 
-        frame = ttk.Frame(self.root, padding=(20, 12))
-        frame.pack(fill="both", expand=True)
-        frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(3, weight=1)
+        outer = ttk.Frame(self.root, padding=(10, 6, 10, 4))
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(1, weight=1)
 
-        ttk.Label(frame, text="Drum MIDI finder", style="Title.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 6))
+        top = ttk.Frame(outer)
+        top.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        top.columnconfigure(0, weight=1)
+        bar = Flow(top, gap=4)
+        bar.grid(row=0, column=0, sticky="ew")
+        for label, menu in (
+            ("File", self.file_menu),
+            ("Edit", self.edit_menu),
+            ("View", self.view_menu),
+            ("Songsterr", self.songsterr_menu),
+            ("Help", self.help_menu),
+        ):
+            bar.add(ttk.Menubutton(bar, text=label, menu=menu, style="Menu.TMenubutton"))
 
-        search = ttk.Frame(frame)
-        search.grid(row=2, column=0, sticky="ew", pady=(0, 12))
-        search.columnconfigure(1, weight=1)
-        search.columnconfigure(3, weight=1)
-        ttk.Label(search, text="Artist", style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        self.artist = ttk.Entry(search)
-        self.artist.grid(row=0, column=1, sticky="ew", padx=(8, 16))
-        ttk.Label(search, text="Song title", style="Section.TLabel").grid(row=0, column=2, sticky="w")
-        self.title = ttk.Entry(search)
-        self.title.grid(row=0, column=3, sticky="ew", padx=(8, 16))
-        self.search_button = ttk.Button(search, text="Search", style="Accent.TButton", command=self.on_search)
-        self.search_button.grid(row=0, column=4, sticky="e")
-        ttk.Button(search, text="Open MIDI…", command=self.open_midi_file).grid(row=0, column=5, sticky="e", padx=(8, 0))
-        self.use_midifind = tk.BooleanVar(value=True)
-        self.use_midiworld = tk.BooleanVar(value=True)
-        sites = ttk.Frame(search)
-        sites.grid(row=1, column=1, columnspan=3, sticky="w", pady=(8, 0))
-        ttk.Checkbutton(sites, text="MIDIfind.com", variable=self.use_midifind).pack(side="left")
-        ttk.Checkbutton(sites, text="MIDIWORLD.com", variable=self.use_midiworld).pack(side="left", padx=(16, 0))
-        self.songsterr_link = tk.Label(
-            search,
-            text="",
-            bg=INK,
-            fg=ACCENT,
-            cursor="hand2",
-            font=("Segoe UI", 10, "underline"),
-            anchor="w",
-        )
-        self.songsterr_link.grid(row=2, column=1, columnspan=4, sticky="w", pady=(8, 0))
-        self.songsterr_link.bind("<Button-1>", self.open_songsterr)
-
-        body = tk.PanedWindow(
-            frame,
-            orient=tk.HORIZONTAL,
-            bg=LINE,
-            sashwidth=8,
-            sashrelief=tk.FLAT,
-            bd=0,
-            opaqueresize=True,
-        )
-        body.grid(row=3, column=0, sticky="nsew")
-
-        left = ttk.Frame(body, padding=(0, 0, 12, 0))
-        left.rowconfigure(1, weight=3)
-        left.rowconfigure(3, weight=2)
-        left.columnconfigure(0, weight=1)
-        self.saved_label = ttk.Label(left, text="Saved songs", style="Section.TLabel")
-        self.saved_label.grid(row=0, column=0, sticky="w", pady=(0, 6))
-        saved_holder, self.saved_list = scroll_around(left, lambda parent: styled_tree(parent))
-        saved_holder.grid(row=1, column=0, sticky="nsew")
-        self.saved_list.bind("<<TreeviewSelect>>", self.on_saved)
-        ttk.Label(left, text="Search results", style="Section.TLabel").grid(row=2, column=0, sticky="w", pady=(14, 6))
-        result_holder, self.results = scroll_around(left, lambda parent: styled_list(parent))
-        self.results.configure(width=28)
-        result_holder.grid(row=3, column=0, sticky="nsew")
-        self.results.bind("<<ListboxSelect>>", lambda _event: self.refresh_buttons())
-        self.download_button = ttk.Button(left, text="Download and parse", command=self.on_download)
-        self.download_button.grid(row=4, column=0, sticky="ew", pady=(10, 0))
-
-        right = ttk.Frame(body, padding=(12, 0, 0, 0))
-        body.add(left, minsize=220, width=320, stretch="never")
-        body.add(right, minsize=680, stretch="always")
-        right.columnconfigure(0, weight=1)
-        right.rowconfigure(3, weight=1, minsize=392)
-        self.heading = ttk.Label(right, text="Pick a saved song", style="Song.TLabel")
-        self.heading.grid(row=0, column=0, sticky="w")
-        self.meta = ttk.Label(right, text="", style="Muted.TLabel")
-        self.meta.grid(row=1, column=0, sticky="w", pady=(2, 0))
-        transport = ttk.Frame(right)
-        transport.grid(row=2, column=0, sticky="ew", pady=(8, 6))
-        buttons = ttk.Frame(transport)
-        buttons.pack(anchor="w")
-
-        def small(parent: tk.Misc, text: str, command, accent: bool = False, gap: int = 6) -> ttk.Button:
-            button = ttk.Button(parent, text=text, command=command, style="SmallAccent.TButton" if accent else "Small.TButton")
-            button.pack(side="left", padx=(gap, 0))
+        def tool(text: str, command, accent: bool = False, space: int = 0, tip: str = "") -> ttk.Button:
+            button = ttk.Button(bar, text=text, command=command, style="SmallAccent.TButton" if accent else "Small.TButton")
+            bar.add(button, space)
+            if tip:
+                Tooltip(button, tip)
             return button
 
-        self.play_all = small(buttons, "Play drums", lambda: self.play("all"), gap=0)
-        self.pause_button = small(buttons, "Pause", self.on_pause_button)
-        small(buttons, "Stop", self.on_stop)
-        self.zoom_out_button = small(buttons, "Zoom out", lambda: self.on_zoom(-1), gap=14)
-        self.zoom_in_button = small(buttons, "Zoom in", lambda: self.on_zoom(1))
-        self.undo_button = small(buttons, "Undo", self.on_undo, gap=14)
-        self.redo_button = small(buttons, "Redo", self.on_redo)
-        small(buttons, "Rehearse on the pedal", self.open_pedal, accent=True, gap=14)
-
-        tab_box = ttk.Frame(transport)
-        tab_box.pack(anchor="w", fill="x", pady=(6, 0))
-        self.tab_info = ttk.Label(tab_box, text="Songsterr: pick a song.", style="Muted.TLabel", wraplength=1000, justify="left")
-        self.tab_info.pack(anchor="w")
-        tab_row = ttk.Frame(tab_box)
-        tab_row.pack(anchor="w", pady=(4, 0))
-        ttk.Label(tab_row, text="Songsterr line-up", style="Section.TLabel").pack(side="left")
-        self.shift_down = small(tab_row, "−", lambda: self.on_shift(-1), gap=8)
-        self.shift_label = ttk.Label(tab_row, text="", width=27, anchor="center")
-        self.shift_label.pack(side="left", padx=(4, 0))
-        self.shift_up = small(tab_row, "+", lambda: self.on_shift(1), gap=4)
-        self.shift_auto = small(tab_row, "Auto", self.on_shift_auto)
-        self.tab_parts_check = ttk.Checkbutton(
-            tab_row, text="Show Songsterr sections", variable=self.show_tab_parts, command=self.redraw_chart
-        )
-        self.tab_parts_check.pack(side="left", padx=(12, 0))
-        self.use_tab_button = small(tab_row, "Use Songsterr sections", self.on_use_tab, gap=12)
-        chrome_row = ttk.Frame(tab_box)
-        chrome_row.pack(anchor="w", pady=(4, 0))
-        self.match_tempo_button = small(chrome_row, "Match Songsterr tempo", self.on_match_tempo, gap=0)
-        ttk.Checkbutton(
-            chrome_row, text="Play along with Songsterr in Chrome", variable=self.follow_chrome, command=self.on_follow_toggle
-        ).pack(side="left", padx=(14, 0))
-        self.chrome_label = ttk.Label(chrome_row, text="", style="Muted.TLabel")
-        self.chrome_label.pack(side="left", padx=(12, 0))
-        small(chrome_row, "Set up Chrome…", self.chrome_setup, gap=12)
-
-        loop_row = ttk.Frame(transport)
-        loop_row.pack(anchor="w", pady=(6, 0))
-        ttk.Checkbutton(loop_row, text="Loop", variable=self.loop_on, command=self.on_loop_toggle).pack(side="left")
-        ttk.Label(loop_row, text="from bar", style="Muted.TLabel").pack(side="left", padx=(10, 4))
-        self.loop_start_entry = ttk.Entry(loop_row, textvariable=self.loop_start, width=5)
-        self.loop_start_entry.pack(side="left")
-        ttk.Label(loop_row, text="for", style="Muted.TLabel").pack(side="left", padx=(6, 4))
-        self.loop_bars_entry = ttk.Entry(loop_row, textvariable=self.loop_bars, width=4)
+        self.play_all = tool("▶  Play", lambda: self.play("all"), accent=True, space=16, tip="Play the song from the selected bar. Space plays and pauses.")
+        self.pause_button = tool("Pause", self.on_pause_button)
+        tool("Stop", self.on_stop)
+        loop = ttk.Frame(bar)
+        ttk.Checkbutton(loop, text="Loop", variable=self.loop_on, command=self.on_loop_toggle).pack(side="left")
+        self.loop_start_entry = ttk.Entry(loop, textvariable=self.loop_start, width=4)
+        self.loop_start_entry.pack(side="left", padx=(6, 0))
+        ttk.Label(loop, text="×", style="Muted.TLabel").pack(side="left", padx=4)
+        self.loop_bars_entry = ttk.Entry(loop, textvariable=self.loop_bars, width=3)
         self.loop_bars_entry.pack(side="left")
-        ttk.Label(loop_row, text="bars", style="Muted.TLabel").pack(side="left", padx=(4, 4))
-        self.delete_button = small(loop_row, "Delete bars", self.on_delete_bars)
-        self.blank_button = small(loop_row, "Blank bars", self.on_blank_bars)
-        ttk.Label(loop_row, text="Right-drag on the chart adds silent bars.", style="Muted.TLabel").pack(side="left", padx=(12, 0))
-        assign_row = ttk.Frame(transport)
-        assign_row.pack(anchor="w", pady=(6, 0))
-        ttk.Label(assign_row, text="Set the selected bars as", style="Section.TLabel").pack(side="left")
-        self.assign_buttons: list[ttk.Button] = []
-        for index, (key, label, _fill) in enumerate(DIVISIONS):
-            short = label.replace("Pattern 1 fill", "P1 fill").replace("Pattern 2 fill", "P2 fill")
-            self.assign_buttons.append(small(assign_row, short, lambda key=key: self.on_assign(key), gap=8 if index == 0 else 4))
-        ttk.Label(assign_row, text="A fill uses the last selected bar.", style="Muted.TLabel").pack(side="left", padx=(10, 0))
+        bar.add(loop, 12)
+        Tooltip(loop, "Loop from a bar, for a number of bars. Drag on the chart to pick bars. Left and Right move the loop; Shift resizes it.")
+        bars_button = ttk.Menubutton(bar, text="Selected bars  ▾", menu=self.bars_menu, style="Menu.TMenubutton")
+        bar.add(bars_button, 12)
+        Tooltip(bars_button, "Make the selected bars a pedal part, or delete or blank them. A fill uses the last selected bar.")
+        tool("Pedal rehearsal", self.open_pedal, space=12, tip="Practise the RC-10R footswitch along with this song.")
+
+        sizer = ttk.Frame(top)
+        sizer.grid(row=0, column=1, sticky="ne", padx=(12, 0), pady=(4, 0))
+        ttk.Label(sizer, text="Text size", style="Section.TLabel").pack(side="left")
+        ttk.Scale(
+            sizer,
+            from_=TEXT_SCALES[0],
+            to=TEXT_SCALES[1],
+            orient="horizontal",
+            length=110,
+            variable=self.text_scale,
+            command=lambda _value: self.on_text_scale(),
+        ).pack(side="left", padx=(8, 6))
+        self.scale_label = ttk.Label(sizer, text="", style="Section.TLabel", width=5)
+        self.scale_label.pack(side="left")
+
+        body = tk.PanedWindow(outer, orient=tk.HORIZONTAL, bg=LINE, sashwidth=6, sashrelief=tk.FLAT, bd=0, opaqueresize=True)
+        body.grid(row=1, column=0, sticky="nsew")
+
+        left = ttk.Frame(body, padding=(0, 0, 8, 0))
+        left.rowconfigure(0, weight=1)
+        left.columnconfigure(0, weight=1)
+        tabs = ttk.Notebook(left)
+        tabs.grid(row=0, column=0, sticky="nsew")
+        self.left_tabs = tabs
+        songs = ttk.Frame(tabs, padding=(0, 6, 0, 0))
+        songs.rowconfigure(1, weight=1)
+        songs.columnconfigure(0, weight=1)
+        self.saved_label = ttk.Label(songs, text="", style="Section.TLabel")
+        self.saved_label.grid(row=0, column=0, sticky="w", pady=(0, 4))
+        Tooltip(self.saved_label, "White songs are in the song list with saved ranges. Grey ones are MIDI files in your source folder; click one to parse it.")
+        saved_holder, self.saved_list = scroll_around(songs, lambda parent: styled_tree(parent))
+        saved_holder.grid(row=1, column=0, sticky="nsew")
+        self.saved_list.bind("<<TreeviewSelect>>", self.on_saved)
+        tabs.add(songs, text="Songs")
+
+        find = ttk.Frame(tabs, padding=(0, 6, 0, 0))
+        find.columnconfigure(0, weight=1)
+        find.rowconfigure(6, weight=1)
+        ttk.Label(find, text="Artist", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        self.artist = ttk.Entry(find)
+        self.artist.grid(row=1, column=0, sticky="ew", pady=(2, 6))
+        ttk.Label(find, text="Song title", style="Section.TLabel").grid(row=2, column=0, sticky="w")
+        self.title = ttk.Entry(find)
+        self.title.grid(row=3, column=0, sticky="ew", pady=(2, 6))
+        for entry in (self.artist, self.title):
+            entry.bind("<Return>", lambda _event: self.on_search())
+        self.use_midifind = tk.BooleanVar(value=True)
+        self.use_midiworld = tk.BooleanVar(value=True)
+        sites = ttk.Frame(find)
+        sites.grid(row=4, column=0, sticky="w")
+        ttk.Checkbutton(sites, text="MIDIfind", variable=self.use_midifind).pack(side="left")
+        ttk.Checkbutton(sites, text="MIDIWORLD", variable=self.use_midiworld).pack(side="left", padx=(10, 0))
+        self.search_button = ttk.Button(find, text="Search", style="Accent.TButton", command=self.on_search)
+        self.search_button.grid(row=5, column=0, sticky="ew", pady=6)
+        result_holder, self.results = scroll_around(find, lambda parent: styled_list(parent))
+        self.results.configure(width=24)
+        result_holder.grid(row=6, column=0, sticky="nsew")
+        self.results.bind("<<ListboxSelect>>", lambda _event: self.refresh_buttons())
+        self.download_button = ttk.Button(find, text="Download and parse", command=self.on_download)
+        self.download_button.grid(row=7, column=0, sticky="ew", pady=(6, 0))
+        tabs.add(find, text="Find online")
+
+        cover = ttk.Frame(left)
+        cover.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        self.cover_holder = tk.Frame(cover, width=COVER_SIZE, height=COVER_SIZE, bg=FIELD, highlightthickness=1, highlightbackground=LINE)
+        self.cover_holder.pack_propagate(False)
+        self.cover_holder.pack(side="left")
+        self.cover_label = tk.Label(self.cover_holder, bg=FIELD, fg=MUTED, font=SMALL_FONT, text="")
+        self.cover_label.pack(fill="both", expand=True)
+        self.album_caption = ttk.Label(cover, text="", style="Muted.TLabel", wraplength=140, justify="left")
+        self.album_caption.pack(side="left", padx=(10, 0))
+
+        self.right_area = ScrollArea(body)
+        right = self.right_area.inner
+        right.configure(padding=(10, 0, 4, 0))
+        body.add(left, minsize=200, width=260, stretch="never")
+        body.add(self.right_area, minsize=520, stretch="always")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(3, weight=1)
+        self.heading = ttk.Label(right, text="Pick a song", style="Song.TLabel")
+        self.heading.grid(row=0, column=0, sticky="w")
+        self.meta = ttk.Label(right, text="", style="Muted.TLabel")
+        self.meta.grid(row=1, column=0, sticky="w")
+        info = ttk.Frame(right)
+        info.grid(row=2, column=0, sticky="ew", pady=(2, 6))
+        info.columnconfigure(0, weight=1)
+        self.tab_info = ttk.Label(info, text="Songsterr: pick a song.", style="Muted.TLabel", justify="left")
+        self.tab_info.grid(row=0, column=0, sticky="w")
+        self.tab_tip = Tooltip(self.tab_info)
+        self.chrome_label = ttk.Label(info, text="", style="Muted.TLabel")
+        self.chrome_label.grid(row=0, column=1, sticky="e", padx=(12, 0))
+        info.bind(
+            "<Configure>",
+            lambda event: self.tab_info.configure(wraplength=max(240, event.width - self.chrome_label.winfo_reqwidth() - 24)),
+        )
         for entry in (self.loop_start_entry, self.loop_bars_entry):
             entry.bind("<FocusOut>", self.on_loop_fields)
             entry.bind("<Return>", self.on_loop_fields)
@@ -1045,75 +1341,69 @@ class Finder:
         self.chart.on_bar_click = self.on_bar_click
         self.chart.on_bars_chosen = self.on_bars_chosen
         self.chart.on_bars_inserted = self.on_bars_inserted
-        self.chart.grid(row=3, column=0, sticky="nsew", pady=(0, 8))
+        self.chart.grid(row=3, column=0, sticky="nsew", pady=(0, 6))
 
         lower = ttk.Frame(right)
         lower.grid(row=4, column=0, sticky="ew")
-        lower.columnconfigure(0, weight=1)
+        lower.columnconfigure(1, weight=1)
+        header = ttk.Frame(lower)
+        header.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        ranges_label = ttk.Label(header, text="Rhythm Converter ranges", style="Section.TLabel")
+        ranges_label.pack(side="left")
+        self.summary = Tooltip(ranges_label)
+        self.kit_value = ttk.Label(header, text="", style="Kit.TLabel")
+        self.kit_value.pack(side="left", padx=(14, 0))
+        self.kit_reason = Tooltip(self.kit_value)
         ranges = ttk.Frame(lower)
-        ranges.grid(row=0, column=0, sticky="nw")
-        banner = ttk.Frame(lower)
-        banner.grid(row=0, column=1, sticky="ne", padx=(24, 0))
-        self.cover_holder = tk.Frame(banner, width=140, height=140, bg=FIELD, highlightthickness=1, highlightbackground=LINE)
-        self.cover_holder.pack_propagate(False)
-        self.cover_holder.pack(anchor="e")
-        self.cover_label = tk.Label(self.cover_holder, bg=FIELD, fg=MUTED, font=("Segoe UI", 9), text="")
-        self.cover_label.pack(fill="both", expand=True)
-        self.album_caption = ttk.Label(banner, text="", style="Muted.TLabel", wraplength=160, justify="right", anchor="e")
-        self.album_caption.pack(anchor="e", pady=(4, 0))
+        ranges.grid(row=1, column=0, sticky="nw")
         self.range_entries: list[ttk.Entry] = []
-        kit_row = ttk.Frame(ranges)
-        kit_row.grid(row=0, column=0, columnspan=13, sticky="w")
-        ttk.Label(kit_row, text="RC-10R kit", style="Section.TLabel").pack(side="left")
-        self.kit_value = ttk.Label(kit_row, text="", style="Song.TLabel")
-        self.kit_value.pack(side="left", padx=(10, 0))
-        self.kit_reason = ttk.Label(ranges, text="", style="Muted.TLabel", wraplength=700, justify="left")
-        self.kit_reason.grid(row=1, column=0, columnspan=13, sticky="w", pady=(0, 6))
         for index, (key, label, _fill) in enumerate(DIVISIONS):
-            row = index % 3 + 2
+            row = index % 3
             base = 0 if index < 3 else 7
             family = {"pattern1Fill": "pattern1", "pattern2Fill": "pattern2"}.get(key, key)
             swatch_color = "#f3f1eb" if key.endswith("Fill") else ROLE[family]
-            tk.Label(ranges, text="    ", bg=swatch_color, width=2).grid(
-                row=row, column=base, sticky="w", pady=2, padx=(0 if base == 0 else 24, 8)
+            tk.Label(ranges, text="  ", bg=swatch_color, width=2).grid(
+                row=row, column=base, sticky="w", pady=2, padx=(0 if base == 0 else 20, 6)
             )
-            ttk.Label(ranges, text=label, width=14).grid(row=row, column=base + 1, sticky="w")
+            ttk.Label(ranges, text=label, width=12).grid(row=row, column=base + 1, sticky="w")
             start = tk.StringVar()
             length = tk.StringVar()
             self.starts[key] = start
             self.lengths[key] = length
-            start_entry = ttk.Entry(ranges, textvariable=start, width=6)
-            length_entry = ttk.Entry(ranges, textvariable=length, width=6)
-            start_entry.grid(row=row, column=base + 2, sticky="w", padx=(4, 4))
+            start_entry = ttk.Entry(ranges, textvariable=start, width=5)
+            length_entry = ttk.Entry(ranges, textvariable=length, width=5)
+            start_entry.grid(row=row, column=base + 2, sticky="w", padx=(2, 4))
             ttk.Label(ranges, text="×", style="Muted.TLabel").grid(row=row, column=base + 3, sticky="w")
-            length_entry.grid(row=row, column=base + 4, sticky="w", padx=(4, 6))
+            length_entry.grid(row=row, column=base + 4, sticky="w", padx=(4, 4))
             for entry in (start_entry, length_entry):
                 entry.bind("<FocusOut>", self.on_ranges)
                 entry.bind("<Return>", self.on_ranges)
                 self.range_entries.append(entry)
-            ttk.Button(ranges, text="Play", style="Small.TButton", command=lambda key=key: self.play(key)).grid(
+            ttk.Button(ranges, text="▶", style="Small.TButton", width=2, command=lambda key=key: self.play(key)).grid(
                 row=row, column=base + 5, sticky="w"
             )
+        actions = ttk.Frame(lower)
+        actions.grid(row=1, column=2, sticky="ne", padx=(16, 0))
+        self.export_button = ttk.Button(actions, text="Save MIDI…", style="Accent.TButton", command=self.open_export)
+        self.export_button.pack(fill="x")
+        Tooltip(self.export_button, "Write a type 0 drum MIDI with your edits for Rhythm Converter (Ctrl+S).")
+        self.add_button = ttk.Button(actions, text="Add to song list…", command=self.on_add)
+        self.add_button.pack(fill="x", pady=(4, 0))
+        Tooltip(self.add_button, "Save these ranges in the song list.")
+        self.copy_button = ttk.Button(actions, text="Copy ranges", command=self.copy_ranges)
+        self.copy_button.pack(fill="x", pady=(4, 0))
 
-        footer = ttk.Frame(right)
-        footer.grid(row=5, column=0, sticky="ew", pady=(10, 0))
-        ttk.Label(footer, text="Note", style="Section.TLabel").pack(side="left", padx=(0, 8))
-        self.note = ttk.Entry(footer)
-        self.note.pack(side="left", fill="x", expand=True)
-        self.add_button = ttk.Button(footer, text="Add to chart", style="Accent.TButton", command=self.on_add)
-        self.add_button.pack(side="left", padx=(8, 0))
-        self.copy_button = ttk.Button(footer, text="Copy ranges", command=self.copy_ranges)
-        self.copy_button.pack(side="left", padx=(8, 0))
-        self.export_button = ttk.Button(footer, text="Save MIDI for RC-10R…", command=self.open_export)
-        self.export_button.pack(side="left", padx=(8, 0))
-        ttk.Button(footer, text="Open chart page", command=self.open_chart).pack(side="left", padx=(8, 0))
-
-        self.summary = ttk.Label(frame, text="The saved list is the chart. Search when you want a new file.", style="Muted.TLabel", wraplength=1080)
-        self.summary.grid(row=4, column=0, sticky="w", pady=(10, 0))
-        self.status = ttk.Label(frame, text="", style="Muted.TLabel", wraplength=1080)
-        self.status.grid(row=5, column=0, sticky="w", pady=(4, 0))
+        self.status = ttk.Label(outer, text="", style="Muted.TLabel")
+        self.status.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        outer.bind("<Configure>", lambda event: self.status.configure(wraplength=max(400, event.width - 30)), add="+")
+        self.root.bind_all("<MouseWheel>", self.on_wheel, add="+")
         self.root.after(100, self.poll_covers)
         self.root.after(30, self.poll_chrome)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_quit)
+        self.source_files = scan_midi(self.source_folder()) if self.source_folder().is_dir() else []
+        self.root.after(SCAN_MS, self.poll_sources)
+        self.on_text_scale()
+        self.chart.set_scale(self.text_scale.get() / 100)
         self.reload_songs()
         self.refresh_buttons()
         self.refresh_transport()
@@ -1143,7 +1433,6 @@ class Finder:
         self.download_button["state"] = "normal" if selected else "disabled"
         editable = bool(self.view and self.view["editable"] and not self.busy)
         self.add_button["state"] = "normal" if editable else "disabled"
-        self.note.configure(state="normal" if editable else "disabled")
         for entry in self.range_entries:
             entry.configure(state="normal" if editable else "disabled")
 
@@ -1153,34 +1442,74 @@ class Finder:
     def reload_songs(self) -> None:
         self.catalog = load_catalog(chart.MAP_PATH)
         self.songs = list(self.catalog["songs"])
-        children = self.saved_list.get_children("")
-        closed = set()
-        for folder in children:
-            if not self.saved_list.item(folder, "open"):
-                closed.add(self.saved_list.item(folder, "text"))
+        tree = self.saved_list
+        children = tree.get_children("")
+        closed = {iid for iid in children if not tree.item(iid, "open")}
+        selected = tree.selection()
         if children:
-            self.saved_list.delete(*children)
+            tree.delete(*children)
         self.song_by_iid = {}
         self.song_iids = {}
-        groups: dict[str, list[dict]] = {}
+        self.file_by_iid = {}
+        root = chart.drum_root(self.catalog)
+        saved_paths = [root / song["file"] for song in self.songs]
+        known = {artist_key(song["artist"]): song["artist"] for song in self.songs}
+        groups: dict[str, list[tuple[str, str, object]]] = {}
+        names: dict[str, str] = {}
+
+        def group(artist: str) -> list:
+            key = artist_key(artist) or artist.casefold()
+            names.setdefault(key, artist)
+            return groups.setdefault(key, [])
+
         for song in self.songs:
-            groups.setdefault(song["artist"], []).append(song)
-        for artist in sorted(groups, key=str.casefold):
-            folder = self.saved_list.insert("", "end", text=artist, open=artist not in closed)
-            for song in sorted(groups[artist], key=lambda item: item["title"].casefold()):
-                iid = self.saved_list.insert(folder, "end", text=song["title"])
-                self.song_by_iid[iid] = song
-                self.song_iids[song["id"]] = iid
-        self.saved_label["text"] = f"Saved songs  ·  {len(self.songs)}"
+            group(song["artist"]).append(("song", song["title"], song))
+        extra = 0
+        folder = self.source_folder()
+        for path in self.source_files:
+            if any(same_file(path, saved) for saved in saved_paths):
+                continue
+            _artist, title = guess_artist_title(path)
+            group(source_artist(path, folder, known)).append(("file", title or path.stem, path))
+            extra += 1
+        for key in sorted(groups, key=lambda item: names[item].casefold()):
+            parent = tree.insert("", "end", iid=f"artist:{key or 'other'}", text=names[key], open=f"artist:{key or 'other'}" not in closed)
+            entries = sorted(groups[key], key=lambda entry: (entry[0] != "song", entry[1].casefold()))
+            titles = [text.casefold() for _kind, text, _item in entries]
+            for kind, text, item in entries:
+                if kind == "song":
+                    iid = tree.insert(parent, "end", iid=f"song:{item['id']}", text=text)
+                    self.song_by_iid[iid] = item
+                    self.song_iids[item["id"]] = iid
+                    continue
+                iid = "file:" + hashlib.md5(os.path.normcase(str(item)).encode("utf-8")).hexdigest()[:16]
+                label = f"{text}  ·  {item.name}" if titles.count(text.casefold()) > 1 else text
+                tree.insert(parent, "end", iid=iid, text=label, tags=("file",))
+                self.file_by_iid[iid] = item
+        tree.tag_configure("file", foreground=MUTED)
+        kept = [iid for iid in selected if tree.exists(iid)]
+        if kept:
+            self._keep_selection = kept[0]
+            tree.selection_set(kept[0])
+        more = f"  ·  {extra} new" if extra else ""
+        self.saved_label["text"] = f"Songs  ·  {len(self.songs)} saved{more}"
 
     def on_saved(self, _event: object = None) -> None:
         selected = self.saved_list.selection()
         if not selected:
             return
+        if getattr(self, "_keep_selection", None) == selected[0]:
+            self._keep_selection = None
+            return
+        self._keep_selection = None
+        path = self.file_by_iid.get(selected[0])
+        if path is not None:
+            self.open_source(path)
+            return
         song = self.song_by_iid.get(selected[0])
         if song is None:
             return
-        path = Path(self.catalog["drumRoot"]) / song["file"]
+        path = chart.drum_root(self.catalog) / song["file"]
         if not path.is_file():
             self.set_status(f"Missing MIDI file: {path}")
             return
@@ -1191,7 +1520,7 @@ class Finder:
             song["title"],
             {key: list(span) for key, span in song["divisions"].items()},
             editable=False,
-            summary="Saved on the chart. Type these into Rhythm Converter. Intro and the ending play once. Patterns and fills loop.",
+            summary="Saved in the song list. Type these into Rhythm Converter. Intro and the ending play once. Patterns and fills loop.",
         )
         self.view["song_id"] = song["id"]
 
@@ -1203,18 +1532,30 @@ class Finder:
         divisions: dict[str, list[int]],
         editable: bool,
         summary: str,
-    ) -> None:
+        midi: dict | None = None,
+    ) -> bool:
+        """Show a song. Returns True when it was open before and comes back as it was left."""
+        self.park_view()
         self.stop(drop_audio=True)
         self.pedal.stop_all()
         self.pedal.clear_tracks()
         self.chrome_played = None
         self.chrome_mark = None
-        midi = chart.parse_midi(path)
+        key = session_key(path, editable)
+        session = self.sessions.pop(key, None)
+        if session is not None and session["stamp"] == file_stamp(path):
+            self.resume_session(session)
+            self.show_view(resumed=True)
+            if self.link_tab is None:
+                self.request_songsterr(self.view["artist"], self.view["title"])
+            return True
+        if midi is None:
+            midi = chart.parse_midi(path)
         hits, meters, boundaries = chart.build_measures(midi)
         parts = suggest_sections.song_parts(midi["events"], boundaries)
         kit, kit_reason = suggest_sections.recommend_kit(midi, artist, title, meters)
         tempo = chart.tempo_text(midi["tempos"])
-        meter = chart.meter_text(meters)
+        meter = brief_meters(chart.meter_text(meters))
         self.view = {
             "path": path,
             "artist": artist,
@@ -1233,38 +1574,103 @@ class Finder:
             "tab_score": 0.0,
             "bars_changed": False,
             "kit": kit,
+            "kit_reason": kit_reason,
             "editable": editable,
             "summary": summary,
             "tempo": tempo,
             "meter": meter,
             "generation": 1,
+            "key": key,
+            "stamp": file_stamp(path),
         }
         self.derive()
-        self.undo_stack.clear()
-        self.redo_stack.clear()
+        self.undo_stack = []
+        self.redo_stack = []
+        self.dirty = False
         self.tab = None
-        self.heading["text"] = f"{artist} — {title}"
-        self.kit_value["text"] = kit
-        self.kit_reason["text"] = kit_reason
-        self.summary["text"] = summary
-        self.sync_entries()
-        self.note.configure(state="normal")
-        self.note.delete(0, "end")
+        self.link_tab = None
+        self.selection = None
         self._loading = True
         self.loop_on.set(False)
         self.loop_start.set("")
         self.loop_bars.set("")
-        self.selection = None
         self._loading = False
-        self.chart.show_selection(None, None)
+        self.show_view(resumed=False)
+        self.request_songsterr(artist, title)
+        return False
+
+    def show_view(self, resumed: bool) -> None:
+        """Fill the panel from self.view, for a song just parsed or one coming back."""
+        view = self.view
+        self.heading["text"] = f"{view['artist']} — {view['title']}"
+        self.kit_value["text"] = f"RC-10R kit: {view['kit']}"
+        self.kit_reason["text"] = view["kit_reason"]
+        self.summary["text"] = view["summary"]
+        self.meta["text"] = f"{view['tempo']}  ·  {view['meter']}  ·  {len(view['hits'])} measures  ·  {song_length(view['bar_ms'][-1] - view['bar_ms'][0])}"
+        self.sync_entries()
+        self.chart._selection = self.selection
+        self.chart.show_selection(*(self.selection or (None, None)))
         self.redraw_chart()
         self.refresh_buttons()
         self.refresh_transport()
-        self.refresh_tab_panel()
+        self.refresh_tab_panel(keep_info=resumed)
         self.update_pedal_display()
-        self.set_status("Click a bar to play from there. Right-drag adds silent bars. Arrows move the loop. Delete changes this preview only.")
-        self.load_cover(artist, title)
-        self.request_songsterr(artist, title)
+        self.set_status("Back where you left this song." if resumed and self.undo_stack else "")
+        self.load_cover(view["artist"], view["title"])
+
+    SESSION_FIELDS = ("view", "undo_stack", "redo_stack", "dirty", "tab", "link_tab", "songsterr_search", "selection", "rendered_generation")
+
+    def park_view(self) -> None:
+        """Keep the open song's state so selecting it again needs no parsing, lookup, or render."""
+        view = self.view
+        if view is None or "key" not in view:
+            return
+        session = {name: getattr(self, name) for name in self.SESSION_FIELDS}
+        session["stamp"] = view["stamp"]
+        session["loop"] = (self.loop_on.get(), self.loop_start.get(), self.loop_bars.get())
+        session["tab_info"] = (self.tab_info["text"], self.tab_tip["text"])
+        self.sessions[view["key"]] = session
+        while len(self.sessions) > KEEP_SESSIONS:
+            oldest = next((key for key, item in self.sessions.items() if not item["dirty"]), None)
+            if oldest is None:
+                break
+            del self.sessions[oldest]
+        self.view = None
+        self.songsterr_token += 1
+
+    def resume_session(self, session: dict) -> None:
+        for name in self.SESSION_FIELDS:
+            setattr(self, name, session[name])
+        self._loading = True
+        looping, start, bars = session["loop"]
+        self.loop_on.set(looping)
+        self.loop_start.set(start)
+        self.loop_bars.set(bars)
+        self._loading = False
+        self.set_tab_info(*session["tab_info"])
+
+    def prune_previews(self) -> None:
+        """Keep rendered audio for the open song and the few most recent others."""
+        keep: set[Path] = set()
+        if self.view and self.rendered_generation is not None:
+            keep.add(preview_path(self.view["key"], self.rendered_generation))
+        recent = list(self.sessions.items())[::-1]
+        for index, (key, session) in enumerate(recent):
+            if session["rendered_generation"] is None:
+                continue
+            if len(keep) < KEEP_PREVIEWS:
+                keep.add(preview_path(key, session["rendered_generation"]))
+            else:
+                session["rendered_generation"] = None
+        clear_previews(keep)
+
+    def forget_session(self, path: Path) -> None:
+        for editable in (True, False):
+            self.sessions.pop(session_key(path, editable), None)
+
+    def unsaved_songs(self) -> int:
+        count = sum(1 for session in self.sessions.values() if session["dirty"])
+        return count + (1 if self.dirty and self.view else 0)
 
     def derive(self) -> None:
         """Recompute times, hit counts, and drum lanes from the tick timeline."""
@@ -1322,9 +1728,13 @@ class Finder:
         if len(self.undo_stack) > HISTORY_LIMIT:
             del self.undo_stack[0]
         self.redo_stack.clear()
+        if label not in LINEUP_LABELS:
+            self.dirty = True
         self.refresh_history()
 
     def restore(self, state: dict) -> None:
+        if state["label"] not in LINEUP_LABELS:
+            self.dirty = True
         view = self.view
         self.stop(drop_audio=True)
         self.pedal.reset()
@@ -1409,11 +1819,20 @@ class Finder:
             pass
         try:
             while True:
-                token, tab, label, url, error = self.songsterr_queue.get_nowait()
-                self.show_songsterr(token, tab, label, url, error)
+                token, tab, error = self.songsterr_queue.get_nowait()
+                self.show_songsterr(token, tab, error)
         except queue.Empty:
             pass
-        self.root.after(100, self.poll_covers)
+        try:
+            while True:
+                self.worker_calls.get_nowait()()
+        except queue.Empty:
+            pass
+        self.root.after(50, self.poll_covers)
+
+    def from_worker(self, call: Callable[[], None]) -> None:
+        """Run call on the Tk thread. Tk must not be touched from a worker thread."""
+        self.worker_calls.put(call)
 
     def show_cover(self, token: int, found: tuple[Path, str] | None) -> None:
         if token != self.cover_token:
@@ -1431,8 +1850,14 @@ class Finder:
             self.cover_label.configure(image="", text="No cover")
             self.album_caption["text"] = ""
             return
-        if photo.width() >= 180:
-            photo = photo.zoom(7).subsample(10)
+        biggest = max(photo.width(), photo.height())
+        if biggest > COVER_SIZE:
+            zoom, shrink = max(
+                ((z, s) for z in (1, 2, 3) for s in range(1, 40) if biggest * z / s <= COVER_SIZE),
+                key=lambda pair: pair[0] / pair[1],
+                default=(1, -(-biggest // COVER_SIZE)),
+            )
+            photo = photo.zoom(zoom).subsample(shrink) if zoom > 1 else photo.subsample(shrink)
         self.cover_photo = photo
         self.cover_label.configure(image=self.cover_photo, text="")
         self.album_caption["text"] = album
@@ -1514,7 +1939,7 @@ class Finder:
             error = ""
         except Exception as exc:
             hits, note, error = [], "", str(exc)
-        self.root.after(0, lambda hits=hits, note=note, error=error: self.show_hits(hits, note, error))
+        self.from_worker(lambda: self.show_hits(hits, note, error))
 
     def show_hits(self, hits: list[Hit], note: str, error: str) -> None:
         self.set_busy(False)
@@ -1538,7 +1963,7 @@ class Finder:
         if not messagebox.askyesno(
             "Download",
             f'Download "{hit.title}" from {hit.site} and suggest loop sections?\n\n'
-            "The file is saved in incoming. Nothing is added to the song list until you click Add to chart.",
+            "The file is saved in incoming. Nothing is added to the song list until you click Add to song list.",
         ):
             self.set_status("Download cancelled.")
             return
@@ -1552,7 +1977,7 @@ class Finder:
             error = ""
         except Exception as exc:
             path, error = None, str(exc)
-        self.root.after(0, lambda path=path, error=error: self.show_download(path, error))
+        self.from_worker(lambda: self.show_download(path, error))
 
     def show_download(self, path: Path | None, error: str) -> None:
         self.set_busy(False)
@@ -1575,7 +2000,7 @@ class Finder:
             editable=True,
             summary=idea.summary,
         )
-        self.set_status("Suggestion ready. Add to chart keeps it, or change a number if a section landed in the wrong place.")
+        self.set_status("Suggestion ready. Add to song list keeps it, or change a number if a section landed in the wrong place.")
 
     def play(self, key: str) -> None:
         if not self.view:
@@ -1882,7 +2307,7 @@ class Finder:
         if view is None:
             return
         generation = view["generation"]
-        path = INCOMING / f"preview-{generation}.wav"
+        path = preview_path(view["key"], generation)
         if self.rendered_generation == generation and path.is_file():
             self.finish_start()
             return
@@ -1918,7 +2343,7 @@ class Finder:
             error = ""
         except Exception as exc:
             wav, error = b"", str(exc)
-        self.root.after(0, lambda wav=wav, error=error: self.begin_rendered(token, generation, wav, error))
+        self.from_worker(lambda: self.begin_rendered(token, generation, wav, error))
 
     def begin_rendered(self, token: int, generation: int, wav: bytes, error: str) -> None:
         if token != self.play_token:
@@ -1932,14 +2357,15 @@ class Finder:
         if not self.view or self.view["generation"] != generation:
             return
         try:
-            INCOMING.mkdir(parents=True, exist_ok=True)
-            path = INCOMING / f"preview-{generation}.wav"
+            PREVIEWS.mkdir(parents=True, exist_ok=True)
+            path = preview_path(self.view["key"], generation)
             path.write_bytes(wav)
         except Exception as exc:
             self.start_failed()
             self.set_status(f"Playback failed: {exc}")
             return
         self.rendered_generation = generation
+        self.prune_previews()
         self.finish_start()
 
     def start_failed(self) -> None:
@@ -1956,7 +2382,7 @@ class Finder:
         file_start = view["bar_ms"][0]
         try:
             if not self.device_open:
-                open_preview(INCOMING / f"preview-{view['generation']}.wav")
+                open_preview(preview_path(view["key"], view["generation"]))
                 self.device_open = True
             play_at(start_ms - file_start)
         except Exception as exc:
@@ -2031,7 +2457,7 @@ class Finder:
         """Follow the pedal path. Ranges change on a bar line, like the RC-10R."""
         bar_ms = self.view["bar_ms"]
         position = self.playhead_ms()
-        seg_start, seg_end = state["segment"]
+        _seg_start, seg_end = state["segment"]
         index = bar_index(bar_ms, position)
         upcoming = None
         crossed = seg_end
@@ -2304,16 +2730,16 @@ class Finder:
             return None, self.bridge.error
         state, age = self.bridge.latest()
         if state is None:
-            return None, "Chrome is not connected. Use Set up Chrome… once."
+            return None, "Chrome: not connected (Songsterr › Set up Chrome…)"
         if age > 1.5:
-            return None, "Chrome stopped answering. Is the Songsterr tab still open?"
+            return None, "Chrome: stopped answering"
         if self.tab is None:
-            return None, "Chrome is connected. Waiting for this song's Songsterr tab to load here."
+            return None, "Chrome: connected, waiting for the tab"
         if state.get("songId") != self.tab.song_id:
             title = str(state.get("title") or "another song").split(" Tab")[0].split(" Drum")[0]
-            return None, f"Chrome is showing {title}. Open this song's Songsterr tab in Chrome."
+            return None, f"Chrome: showing {title}"
         if state.get("measure") is None:
-            return None, "Chrome is on this song but the cursor is not visible yet."
+            return None, "Chrome: cursor not visible yet"
         return state, ""
 
     def chrome_live(self) -> bool:
@@ -2371,19 +2797,19 @@ class Finder:
             self.show_chrome_text(why)
             return
         if self.pending_pedal or (self.playing and self.playing.get("pedal")):
-            self.show_chrome_text("Connected. The pedal rehearsal is playing, so the drums are not following.")
+            self.show_chrome_text("Chrome: paused for the pedal rehearsal")
             return
         found = self.chrome_target(state)
         speed = int(state.get("speed") or 100)
-        slow = f" Songsterr speed is {speed}%, but the drums play at full speed and catch up every bar." if speed != 100 else ""
+        slow = f" · tab at {speed}% speed" if speed != 100 else ""
         if found is None:
-            self.show_chrome_text(f"Connected. Tab bar {int(state['measure']) + 1} is outside this MIDI." + slow)
+            self.show_chrome_text(f"Chrome: tab bar {int(state['measure']) + 1} is outside this MIDI" + slow)
             if following and not self.playing.get("paused"):
                 self.pause_playback()
             return
         target, tab_bar, midi_bar = found
         word = "Playing" if state.get("playing") else "Paused"
-        self.show_chrome_text(f"Connected. {word} at tab bar {tab_bar} = MIDI bar {midi_bar}." + slow)
+        self.show_chrome_text(f"Chrome: {word.lower()} · tab bar {tab_bar} = MIDI bar {midi_bar}" + slow)
         if not state.get("playing"):
             if following and not self.playing.get("paused"):
                 self.pause_playback()
@@ -2435,9 +2861,9 @@ class Finder:
             "2. Turn on Developer mode (top right).\n"
             "3. Click Load unpacked and choose this folder:\n"
             f"    {folder}\n\n"
-            "Then open the song's Songsterr tab in Chrome (the link under the search bar) and press play there, "
-            "or press Play drums here. The drums follow Songsterr's cursor bar by bar. "
-            "The line-up (− / +) decides which MIDI bar matches each tab bar.\n\n"
+            "Then open the song's drum, guitar or bass tab from the Songsterr menu and press play there, "
+            "or press Play here. The drums follow Songsterr's cursor bar by bar, whichever part is open. "
+            "The line-up (Songsterr menu) decides which MIDI bar matches each tab bar.\n\n"
             "The helper only talks to this computer (127.0.0.1). Keep the Chrome window at least partly visible, "
             "because Chrome slows hidden tabs.\n\n"
             "Open the folder now?"
@@ -2450,44 +2876,40 @@ class Finder:
             return
         self.songsterr_token += 1
         token = self.songsterr_token
-        self.songsterr_url = ""
-        self.songsterr_link.configure(text="Finding the Songsterr tab…", fg=MUTED)
+        self.link_tab = None
+        self.songsterr_search = songsterr.search_url(artist, title)
         if self.view is not None:
             self.tab = None
-            self.tab_info["text"] = "Songsterr: reading the tab for sections, tempo, and meter…"
+            self.set_tab_info("Songsterr: reading the tab…")
             self.refresh_tab_panel(keep_info=True)
         threading.Thread(target=self.songsterr_worker, args=(token, artist, title), daemon=True).start()
 
     def songsterr_worker(self, token: int, artist: str, title: str) -> None:
         tab, error = lookup_songsterr(artist, title)
-        if tab is None:
-            label = f"Songsterr search · {' '.join(part for part in (artist, title) if part)}"
-            url = songsterr.search_url(artist, title)
-        else:
-            label, url = tab.label, tab.url
-        self.songsterr_queue.put((token, tab, label, url, error))
+        self.songsterr_queue.put((token, tab, error))
 
-    def show_songsterr(self, token: int, tab: songsterr.Tab | None, label: str, url: str, error: str) -> None:
+    def show_songsterr(self, token: int, tab: songsterr.Tab | None, error: str) -> None:
         if token != self.songsterr_token:
             return
-        self.songsterr_url = url
-        self.songsterr_link.configure(text=label, fg=ACCENT)
+        self.link_tab = tab
         if self.view is None:
             return
-        same_song = tab is not None and songsterr.slug(tab.title) == songsterr.slug(self.view["title"])
+        same_song = tab is not None and songsterr.same_title(tab.title, self.view["title"])
         if tab is None or not tab.bars:
             self.tab = None
             self.view["tab_parts"] = []
             reason = error or (tab.error if tab else "") or "Songsterr has no tab data for this song."
-            self.tab_info["text"] = f"Songsterr: {reason} The chart keeps the drum-based section names."
+            self.set_tab_info(f"Songsterr: {reason}", f"Songsterr: {reason} The chart keeps the drum-based section names.")
             self.refresh_tab_panel(keep_info=True)
             self.redraw_chart()
             return
         if not same_song:
             self.tab = None
             self.view["tab_parts"] = []
-            self.tab_info["text"] = (
-                f"Songsterr: the closest tab is {tab.artist} — {tab.title}, which is not this song. Open the link to search by hand."
+            self.set_tab_info(
+                f"Songsterr: closest tab is {tab.artist} — {tab.title}, not this song.",
+                f"Songsterr: the closest tab is {tab.artist} — {tab.title}, which is not this song. "
+                "Songsterr › Search Songsterr for this song finds it by hand; Edit › Song name… tries another name.",
             )
             self.refresh_tab_panel(keep_info=True)
             self.redraw_chart()
@@ -2519,7 +2941,7 @@ class Finder:
         if not ready:
             self.shift_label["text"] = ""
             if not keep_info:
-                self.tab_info["text"] = "Songsterr: pick a song."
+                self.set_tab_info("Songsterr: pick a song.")
             return
         shift = view["tab_shift"]
         half = view["tab_half"]
@@ -2532,7 +2954,7 @@ class Finder:
         tab_ms = tab.seconds() * 1000
         bpm = tab.first_bpm()
         midi_bpm = round(60_000_000 / view["tempos"][0][1]) if view["tempos"] else None
-        facts = [f"{tab.count} bars", tab.meter_text()]
+        facts = [f"{tab.count} bars", brief_meters(tab.meter_text())]
         if bpm:
             facts.insert(1, f"{bpm:g} BPM")
         facts.append(song_length(tab_ms))
@@ -2551,7 +2973,11 @@ class Finder:
             lines.append("The drum match is weak. Check the line-up by ear and use − or + to move it.")
         if not tab.sections:
             lines.append("This tab has no section names, so the chart keeps the drum-based names.")
-        self.tab_info["text"] = " ".join(lines)
+        quality = "lines up well" if view["tab_sure"] else "weak match, check the line-up"
+        short = [f"Songsterr: {tab.count} bars", f"{bpm:g} BPM" if bpm else "", song_length(tab_ms), line, quality]
+        if half:
+            short.append("half time")
+        self.set_tab_info("  ·  ".join(part for part in short if part), " ".join(lines))
 
     def on_shift(self, step: int) -> None:
         if not self.view or not self.tab:
@@ -2617,33 +3043,398 @@ class Finder:
             "Use Save MIDI to keep it."
         )
 
+    def build_menus(self) -> None:
+        def make() -> tk.Menu:
+            return tk.Menu(
+                self.root,
+                tearoff=False,
+                bg=FIELD,
+                fg=TEXT,
+                activebackground=ACCENT,
+                activeforeground=ACCENT_INK,
+                disabledforeground=DISABLED_TEXT,
+                selectcolor=TEXT,
+                relief="flat",
+                bd=1,
+                font=UI_FONT,
+            )
+
+        self.entries: dict[str, MenuEntry] = {}
+
+        def add(menu: tk.Menu, key: str, label: str, command, accelerator: str = "", prefix: str = "") -> MenuEntry:
+            menu.add_command(label=label, command=command, accelerator=accelerator)
+            entry = MenuEntry([(menu, menu.index("end"))], prefix)
+            self.entries[key] = entry
+            return entry
+
+        file = self.file_menu = make()
+        add(file, "open", "Open MIDI…", self.open_midi_file, "Ctrl+O")
+        add(file, "save", "Save MIDI for RC-10R…", self.open_export, "Ctrl+S")
+        add(file, "copy", "Copy ranges", self.copy_ranges)
+        add(file, "add", "Add to song list…", self.on_add)
+        file.add_separator()
+        add(file, "source", "Source MIDI folder…", self.choose_source_folder)
+        add(file, "show_source", "Show source folder", lambda: self.show_folder(self.source_folder()))
+        add(file, "final", "Final MIDI folder…", self.choose_output_folder)
+        add(file, "show_final", "Show final folder", lambda: self.show_folder(self.output_folder()))
+        add(file, "refresh", "Refresh song list", self.refresh_sources, "F5")
+        file.add_separator()
+        add(file, "quit", "Quit", self.on_quit, "Ctrl+Q")
+
+        self.bars_menu = make()
+        bars_cascade = make()
+        places: dict[str, list[tuple[tk.Menu, int]]] = {}
+        for menu in (self.bars_menu, bars_cascade):
+            for key, label, _fill in DIVISIONS:
+                menu.add_command(label=f"Set as {label}", command=lambda key=key: self.on_assign(key))
+                places.setdefault(key, []).append((menu, menu.index("end")))
+            menu.add_separator()
+            menu.add_command(label="Delete bars", accelerator="Del", command=self.on_delete_bars)
+            places.setdefault("delete", []).append((menu, menu.index("end")))
+            menu.add_command(label="Blank bars (keep their time)", command=self.on_blank_bars)
+            places.setdefault("blank", []).append((menu, menu.index("end")))
+        self.assign_buttons = [MenuEntry(places[key]) for key, _label, _fill in DIVISIONS]
+        self.delete_button = MenuEntry(places["delete"])
+        self.blank_button = MenuEntry(places["blank"])
+
+        edit = self.edit_menu = make()
+        self.undo_button = add(edit, "undo", "Undo", self.on_undo, "Ctrl+Z")
+        self.redo_button = add(edit, "redo", "Redo", self.on_redo, "Ctrl+Y")
+        edit.add_separator()
+        edit.add_cascade(label="Selected bars", menu=bars_cascade)
+        edit.add_separator()
+        add(edit, "rename", "Song name…", self.rename_song)
+
+        view = self.view_menu = make()
+        add(view, "zoom_in", "Zoom in", lambda: self.on_zoom(1), "Ctrl++")
+        add(view, "zoom_out", "Zoom out", lambda: self.on_zoom(-1), "Ctrl+−")
+        view.add_separator()
+        view.add_checkbutton(label="Show Songsterr sections", variable=self.show_tab_parts, command=self.redraw_chart)
+        self.tab_parts_check = MenuEntry([(view, view.index("end"))])
+        view.add_separator()
+        add(view, "bigger", "Bigger text", lambda: self.step_text_scale(10))
+        add(view, "smaller", "Smaller text", lambda: self.step_text_scale(-10))
+        add(view, "normal", "Normal text size", lambda: self.step_text_scale(0))
+
+        tab = self.songsterr_menu = make()
+        for kind in songsterr.PART_KINDS:
+            add(tab, f"part_{kind}", f"Open the {PART_NOUNS[kind]} tab", lambda kind=kind: self.open_songsterr(kind))
+        self.parts_menu = make()
+        tab.add_cascade(label="Open another part", menu=self.parts_menu)
+        self.parts_cascade = MenuEntry([(tab, tab.index("end"))])
+        add(tab, "search", "Search Songsterr for this song", self.search_songsterr)
+        tab.add_separator()
+        self.shift_label = add(tab, "shift_label", "Line-up: —", lambda: None, prefix="Line-up: ")
+        self.shift_label.configure(state="disabled")
+        self.shift_down = add(tab, "shift_down", "Move the tab one bar earlier", lambda: self.on_shift(-1))
+        self.shift_up = add(tab, "shift_up", "Move the tab one bar later", lambda: self.on_shift(1))
+        self.shift_auto = add(tab, "shift_auto", "Line up automatically", self.on_shift_auto)
+        tab.add_separator()
+        self.use_tab_button = add(tab, "use_tab", "Use Songsterr sections", self.on_use_tab)
+        self.match_tempo_button = add(tab, "match", "Match Songsterr tempo…", self.on_match_tempo)
+        tab.add_separator()
+        tab.add_checkbutton(label="Play along with Songsterr in Chrome", variable=self.follow_chrome, command=self.on_follow_toggle)
+        add(tab, "chrome_setup", "Set up Chrome…", self.chrome_setup)
+
+        self.help_menu = make()
+        add(self.help_menu, "tips", "Chart and keyboard tips", self.show_tips)
+
+        for menu in (file, edit, view, tab, self.bars_menu, bars_cascade):
+            menu.configure(postcommand=self.refresh_menu)
+        keys = {
+            "<Control-o>": self.open_midi_file,
+            "<Control-s>": self.open_export,
+            "<Control-q>": self.on_quit,
+            "<F5>": self.refresh_sources,
+            "<Control-plus>": lambda: self.on_zoom(1),
+            "<Control-equal>": lambda: self.on_zoom(1),
+            "<Control-minus>": lambda: self.on_zoom(-1),
+        }
+        for sequence, command in keys.items():
+            self.root.bind_all(sequence, lambda _event, command=command: (command(), "break")[1])
+        for sequence, command in (("<Control-z>", self.on_undo), ("<Control-y>", self.on_redo)):
+            self.root.bind_all(sequence, lambda _event, command=command: None if self.typing_focus() else (command(), "break")[1])
+
+    def refresh_menu(self) -> None:
+        def enable(key: str, on: bool) -> None:
+            self.entries[key].configure(state="normal" if on else "disabled")
+
+        view = self.view
+        enable("save", bool(view))
+        enable("copy", bool(view))
+        enable("add", bool(view and view["editable"] and not self.busy))
+        enable("rename", bool(view))
+        enable("zoom_in", bool(view) and self.chart.can_zoom(1))
+        enable("zoom_out", bool(view) and self.chart.can_zoom(-1))
+        enable("search", bool(self.songsterr_search))
+        tab = self.link_tab
+        for kind in songsterr.PART_KINDS:
+            noun = PART_NOUNS[kind]
+            part = tab.best_part(kind) if tab else None
+            if part is not None:
+                self.entries[f"part_{kind}"].configure(state="normal", text=f"Open the {noun} tab · {part.name}")
+            elif tab is not None:
+                self.entries[f"part_{kind}"].configure(state="disabled", text=f"No {noun} tab on Songsterr")
+            else:
+                self.entries[f"part_{kind}"].configure(state="disabled", text=f"Open the {noun} tab")
+        self.parts_menu.delete(0, "end")
+        for part in tab.parts if tab else []:
+            self.parts_menu.add_command(label=part.name, command=lambda index=part.index: self.open_songsterr_part(index))
+        self.parts_cascade.configure(state="normal" if tab and tab.parts else "disabled")
+        self.entries["source"].configure(text=f"Source MIDI folder…   ({short_path(self.source_folder())})")
+        self.entries["final"].configure(text=f"Final MIDI folder…   ({short_path(self.output_folder())})")
+
+    def on_text_scale(self) -> None:
+        value = int(round(self.text_scale.get() / 5) * 5)
+        if value != self.text_scale.get():
+            self.text_scale.set(value)
+        if value == self._applied_scale:
+            return
+        self._applied_scale = value
+        scale = value / 100
+        scale_fonts(self.root, scale)
+        self.scale_label["text"] = f"{value}%"
+        self.settings["textScale"] = scale
+        if self._scale_job is not None:
+            self.root.after_cancel(self._scale_job)
+        self._scale_job = self.root.after(150, lambda: self.chart.set_scale(scale))
+
+    def step_text_scale(self, step: int) -> None:
+        low, high = TEXT_SCALES
+        value = 100 if step == 0 else max(low, min(high, self.text_scale.get() + step))
+        self.text_scale.set(value)
+        self.on_text_scale()
+
+    def on_wheel(self, event: tk.Event) -> None:
+        if event.state & 0x0004:
+            return
+        widget = self.root.winfo_containing(event.x_root, event.y_root)
+        if self.right_area.contains(widget):
+            self.right_area.scroll(-1 if event.delta > 0 else 1)
+
+    def show_tips(self) -> None:
+        messagebox.showinfo(
+            "Chart and keyboard tips",
+            "Chart\n"
+            "• Click a bar to play from it. Drag to select bars.\n"
+            "• Right-drag adds silent bars.\n"
+            "• Ctrl + mouse wheel zooms.\n\n"
+            "Keys\n"
+            "• Space plays and pauses.\n"
+            "• Left and Right move the loop; Shift resizes it.\n"
+            "• Delete removes the selected bars.\n"
+            "• Ctrl+Z and Ctrl+Y undo and redo.\n\n"
+            "Ranges\n"
+            "• Type start × length into Rhythm Converter.\n"
+            "• The intro and ending play once. Patterns and fills loop.",
+            parent=self.root,
+        )
+
+    def ask_fields(self, title: str, fields: list[tuple[str, str]], note: str = "") -> list[str] | None:
+        """A small dark dialog with one entry per field. None if cancelled."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.configure(bg=INK)
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dark_titlebar(dialog)
+        frame = ttk.Frame(dialog, padding=16)
+        frame.pack(fill="both", expand=True)
+        if note:
+            ttk.Label(frame, text=note, style="Muted.TLabel", wraplength=400, justify="left").pack(anchor="w", pady=(0, 10))
+        entries = []
+        for label, value in fields:
+            ttk.Label(frame, text=label, style="Section.TLabel").pack(anchor="w")
+            entry = ttk.Entry(frame, width=44)
+            entry.insert(0, value)
+            entry.pack(fill="x", pady=(2, 8))
+            entries.append(entry)
+        result: list[str] = []
+
+        def done(_event: object = None) -> None:
+            result.extend(entry.get().strip() for entry in entries)
+            dialog.destroy()
+
+        row = ttk.Frame(frame)
+        row.pack(anchor="e", pady=(4, 0))
+        ttk.Button(row, text="Cancel", command=dialog.destroy).pack(side="right")
+        ttk.Button(row, text="OK", style="Accent.TButton", command=done).pack(side="right", padx=(0, 8))
+        dialog.bind("<Return>", done)
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        entries[0].focus_set()
+        entries[0].select_range(0, "end")
+        dialog.grab_set()
+        self.root.wait_window(dialog)
+        return result or None
+
+    def rename_song(self) -> None:
+        view = self.view
+        if not view:
+            return
+        answer = self.ask_fields(
+            "Song name",
+            [("Artist", view["artist"]), ("Song title", view["title"])],
+            "Used to find the Songsterr tab and the album cover.",
+        )
+        if not answer or not answer[1]:
+            return
+        artist, title = answer[0] or "Unknown", answer[1]
+        if (artist, title) == (view["artist"], view["title"]):
+            return
+        view["artist"], view["title"] = artist, title
+        self.heading["text"] = f"{artist} — {title}"
+        for entry, value in ((self.artist, artist), (self.title, title)):
+            entry.delete(0, "end")
+            entry.insert(0, value)
+        self.request_songsterr(artist, title)
+        self.load_cover(artist, title)
+        self.set_status(f"Renamed to {artist} — {title}; looking up Songsterr again.")
+
+    def set_tab_info(self, text: str, full: str = "") -> None:
+        self.tab_info["text"] = text
+        self.tab_tip["text"] = full if full and full != text else ""
+
+    def source_folder(self) -> Path:
+        chosen = self.settings.get("sourceFolder")
+        if chosen:
+            return Path(chosen)
+        return chart.drum_root(self.catalog or load_catalog(chart.MAP_PATH))
+
+    def output_folder(self) -> Path:
+        chosen = self.settings.get("finalFolder")
+        return Path(chosen) if chosen else EXPORTS
+
+    def choose_folder(self, key: str, title: str, current: Path) -> Path | None:
+        chosen = filedialog.askdirectory(
+            parent=self.root, title=title, initialdir=str(current if current.is_dir() else ROOT), mustexist=True
+        )
+        if not chosen:
+            return None
+        self.settings[key] = str(Path(chosen))
+        try:
+            save_settings(self.settings)
+        except OSError as exc:
+            self.set_status(f"The folder is set for now, but it could not be remembered: {exc}")
+        return Path(chosen)
+
+    def choose_source_folder(self) -> None:
+        folder = self.choose_folder("sourceFolder", "Folder with your source drum MIDIs", self.source_folder())
+        if folder:
+            self.refresh_sources()
+            count = len(self.file_by_iid)
+            self.set_status(f"Source folder: {folder}. {count} file{'s' if count != 1 else ''} not in the song list yet. Click one to parse it.")
+
+    def choose_output_folder(self) -> None:
+        folder = self.choose_folder("finalFolder", "Folder for finished RC-10R MIDIs", self.output_folder())
+        if folder:
+            self.set_status(f"Save MIDI now saves into {folder}.")
+
+    def show_folder(self, folder: Path) -> None:
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            os.startfile(folder)
+        except OSError as exc:
+            self.set_status(f"Could not open {folder}: {exc}")
+
+    def refresh_sources(self) -> None:
+        folder = self.source_folder()
+        self.source_files = scan_midi(folder) if folder.is_dir() else []
+        self.reload_songs()
+        if not folder.is_dir():
+            self.set_status(f"The source folder is missing: {folder}. Set it under File.")
+
+    def poll_sources(self) -> None:
+        try:
+            while True:
+                folder, files = self.scan_queue.get_nowait()
+                if folder == str(self.source_folder()) and files != self.source_files:
+                    added = len(set(files) - set(self.source_files))
+                    self.source_files = files
+                    self.reload_songs()
+                    if added:
+                        self.set_status(f"Found {added} new MIDI file{'s' if added != 1 else ''} in the source folder.")
+        except queue.Empty:
+            pass
+        if not self.scanning:
+            self.scanning = True
+            folder = self.source_folder()
+
+            def work() -> None:
+                try:
+                    files = scan_midi(folder) if folder.is_dir() else []
+                except OSError:
+                    files = self.source_files
+                self.scan_queue.put((str(folder), files))
+                self.scanning = False
+
+            threading.Thread(target=work, daemon=True).start()
+        self.root.after(SCAN_MS, self.poll_sources)
+
+    def on_quit(self) -> None:
+        unsaved = self.unsaved_songs()
+        if unsaved and not messagebox.askyesno(
+            "Quit",
+            f"{unsaved} song{'s have' if unsaved != 1 else ' has'} edits that are not saved as a MIDI file. Quit anyway?",
+            parent=self.root,
+        ):
+            return
+        try:
+            self.stop()
+        except Exception:
+            pass
+        if self.pedal_window:
+            try:
+                self.pedal_window.close()
+            except Exception:
+                pass
+        if self.root.state() == "normal":
+            self.settings["geometry"] = self.root.geometry()
+        try:
+            save_settings(self.settings)
+        except OSError:
+            pass
+        self.bridge.close()
+        clear_previews()
+        self.root.destroy()
+
     def open_midi_file(self) -> None:
-        start = Path(self.catalog.get("drumRoot") or ROOT) if getattr(self, "catalog", None) else ROOT
+        start = self.source_folder()
         chosen = filedialog.askopenfilename(
             parent=self.root,
             title="Open a MIDI file",
             initialdir=str(start if start.is_dir() else ROOT),
             filetypes=[("MIDI files", "*.mid *.midi *.kar"), ("All files", "*.*")],
         )
-        if not chosen:
-            return
-        path = Path(chosen)
+        if chosen:
+            self.saved_list.selection_set(())
+            self.open_source(Path(chosen))
+
+    def open_source(self, path: Path) -> None:
         artist, title = guess_artist_title(path)
-        try:
-            midi = chart.parse_midi(path)
-            _hits, _meters, boundaries = chart.build_measures(midi)
-            idea = suggest_sections.suggest(midi["events"], boundaries)
-        except Exception as exc:
-            messagebox.showerror("Open MIDI", f"This file could not be read as a drum MIDI.\n\n{exc}", parent=self.root)
-            return
-        self.artist.delete(0, "end")
-        self.artist.insert(0, artist)
-        self.title.delete(0, "end")
-        self.title.insert(0, title)
-        self.saved_list.selection_set(())
+        artist = source_artist(path, self.source_folder(), {artist_key(song["artist"]): song["artist"] for song in self.songs})
+        if artist == "Other files":
+            artist = ""
         self.results.selection_clear(0, "end")
-        self.show_file(path, artist or "Unknown", title, idea.divisions, editable=True, summary=idea.summary)
-        self.set_status(f"Opened {path.name}. Check the artist and title above so Songsterr finds the right tab.")
+        session = self.sessions.get(session_key(path, True))
+        if session is not None and session["stamp"] == file_stamp(path):
+            self.show_file(path, artist, title, {}, editable=True, summary="")
+        else:
+            self.set_status(f"Parsing {path.name}…")
+            self.root.update_idletasks()
+            try:
+                midi = chart.parse_midi(path)
+                _hits, _meters, boundaries = chart.build_measures(midi)
+                idea = suggest_sections.suggest(midi["events"], boundaries)
+            except Exception as exc:
+                messagebox.showerror("Open MIDI", f"{path.name} could not be read as a drum MIDI.\n\n{exc}", parent=self.root)
+                self.set_status(f"Could not parse {path.name}.")
+                return
+            self.show_file(path, artist or "Unknown", title, idea.divisions, editable=True, summary=idea.summary, midi=midi)
+            self.set_status(f"Parsed {path.name}. If Songsterr finds the wrong tab, fix the name under Edit › Song name….")
+        self.artist.delete(0, "end")
+        self.artist.insert(0, self.view["artist"] if self.view["artist"] != "Unknown" else "")
+        self.title.delete(0, "end")
+        self.title.insert(0, self.view["title"])
 
     def on_use_tab(self) -> None:
         view = self.view
@@ -2669,17 +3460,29 @@ class Finder:
         self.update_pedal_display()
         self.set_status("Set from Songsterr. " + " ".join(notes) + " Undo puts the old ranges back.")
 
-    def open_songsterr(self, _event: object = None) -> None:
-        if self.songsterr_url:
-            os.startfile(self.songsterr_url)
+    def open_songsterr(self, kind: str = "drums") -> None:
+        part = self.link_tab.best_part(kind) if self.link_tab else None
+        if part is not None:
+            self.open_songsterr_part(part.index)
+        else:
+            self.search_songsterr()
+
+    def open_songsterr_part(self, index: int) -> None:
+        if self.link_tab is not None:
+            os.startfile(self.link_tab.part_url(index))
+
+    def search_songsterr(self) -> None:
+        if self.songsterr_search:
+            os.startfile(self.songsterr_search)
 
     def on_zoom(self, direction: int) -> None:
+        if not self.view or not self.chart.can_zoom(direction):
+            return
         self.chart.zoom(direction)
         self.refresh_zoom()
 
     def refresh_zoom(self) -> None:
-        self.zoom_out_button["state"] = "normal" if self.chart.can_zoom(-1) else "disabled"
-        self.zoom_in_button["state"] = "normal" if self.chart.can_zoom(1) else "disabled"
+        self.refresh_menu()
 
     def refresh_transport(self) -> None:
         if self.playing and self.playing.get("paused"):
@@ -2716,12 +3519,6 @@ class Finder:
         self.update_pedal_display()
         if drop_audio:
             self.rendered_generation = None
-            if INCOMING.is_dir():
-                for path in INCOMING.glob("preview-*.wav"):
-                    try:
-                        path.unlink()
-                    except OSError:
-                        pass
         self.refresh_transport()
 
     def on_add(self) -> None:
@@ -2738,23 +3535,20 @@ class Finder:
         typed = "\n".join(typing_lines(divisions))
         if self.view.get("bars_changed") and not messagebox.askyesno(
             "Bar edits are not in the file",
-            "You deleted, blanked, or added bars. Add to chart copies the original MIDI, so these ranges "
+            "You deleted, blanked, or added bars. Add to song list keeps the original MIDI, so these ranges "
             "would point at the original bars.\n\n"
             "To keep the edits, use Save MIDI for RC-10R instead. Add the original file anyway?",
         ):
-            self.set_status("Chart update cancelled.")
+            self.set_status("Not added.")
             return
         if not messagebox.askyesno(
-            "Add to chart",
-            f"Add {artist} — {title} with these ranges?\n\n{typed}\n\n"
-            "The MIDI is copied into the drum folder and the chart page is rebuilt. "
-            "You still type the numbers into Rhythm Converter.",
+            "Add to song list", f"Add {artist} — {title} with these ranges?\n\n{typed}", parent=self.root
         ):
-            self.set_status("Chart update cancelled.")
+            self.set_status("Not added.")
             return
         self.set_busy(True)
-        self.set_status("Copying the file and rebuilding the chart…")
-        note = self.note.get()
+        self.set_status("Adding to the song list…")
+        note = ""
         path = self.view["path"]
         threading.Thread(
             target=self.add_worker,
@@ -2769,7 +3563,7 @@ class Finder:
         except Exception as exc:
             report, error = "", str(exc)
         song = song_id(title)
-        self.root.after(0, lambda report=report, error=error: self.finish_add(report, error, song))
+        self.from_worker(lambda: self.finish_add(report, error, song))
 
     def finish_add(self, report: str, error: str, song: str) -> None:
         self.set_busy(False)
@@ -2777,6 +3571,9 @@ class Finder:
             self.set_status(error)
             return
         self.reload_songs()
+        saved = next((item for item in self.songs if item["id"] == song), None)
+        if saved is not None:
+            self.forget_session(chart.drum_root(self.catalog) / saved["file"])
         iid = self.song_iids.get(song)
         if iid:
             self.saved_list.selection_set(iid)
@@ -2801,10 +3598,6 @@ class Finder:
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
         self.set_status("Ranges copied.")
-
-    def open_folder(self) -> None:
-        INCOMING.mkdir(parents=True, exist_ok=True)
-        os.startfile(INCOMING)
 
     def export_data(self, mode: str) -> tuple[bytes, dict[str, list[int]], int]:
         view = self.view
@@ -2887,7 +3680,7 @@ class Finder:
             elif not source.is_file():
                 reason = "The original file is missing."
             elif locked:
-                reason = "This song's ranges are locked on the chart, and your bar edits would move them. Keep the original instead."
+                reason = "This song's ranges are locked, and your bar edits would move them. Keep the original instead."
             if reason:
                 keep.set("keep")
                 replace_button.state(["disabled"])
@@ -2905,7 +3698,12 @@ class Finder:
         def save() -> None:
             choice = mode.get()
             data, divisions, _bars = self.export_data(choice)
-            EXPORTS.mkdir(parents=True, exist_ok=True)
+            final = self.output_folder()
+            try:
+                final.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                messagebox.showerror("Save MIDI", f"The final MIDI folder could not be made.\n\n{exc}", parent=dialog)
+                return
             suffix = "RC-10R pedal parts" if choice == "parts" else "RC-10R"
             filename = safe_name(f"{view['artist']} - {view['title']} ({suffix}).mid", "drums.mid")
             if keep.get() == "replace":
@@ -2916,7 +3714,7 @@ class Finder:
                 ):
                     return
                 path = source
-                notes_path = EXPORTS / Path(filename).with_suffix(".txt").name
+                notes_path = final / Path(filename).with_suffix(".txt").name
                 try:
                     to_recycle_bin(source)
                 except OSError as exc:
@@ -2925,7 +3723,7 @@ class Finder:
             else:
                 chosen = filedialog.asksaveasfilename(
                     parent=dialog,
-                    initialdir=str(EXPORTS),
+                    initialdir=str(final),
                     initialfile=filename,
                     defaultextension=".mid",
                     filetypes=[("MIDI file", "*.mid")],
@@ -2943,6 +3741,7 @@ class Finder:
                 messagebox.showerror("Save MIDI", f"The file could not be saved.\n\n{exc}", parent=dialog)
                 return
             dialog.destroy()
+            self.dirty = False
             typed = "\n".join(typing_lines(divisions))
             if path == source:
                 self.set_status(f"Replaced {path.name} with the edited drums. The old file is in the Recycle Bin. Ranges are in {notes_path}.")
@@ -2963,12 +3762,6 @@ class Finder:
         ttk.Button(row, text="Cancel", command=dialog.destroy).pack(side="right")
         ttk.Button(row, text="Save…", style="Accent.TButton", command=save).pack(side="right", padx=(0, 8))
         dialog.grab_set()
-
-    def open_chart(self) -> None:
-        if chart.OUT_PATH.is_file():
-            os.startfile(chart.OUT_PATH)
-        else:
-            self.set_status("The chart page has not been built yet.")
 
     def run(self) -> None:
         self.root.mainloop()
