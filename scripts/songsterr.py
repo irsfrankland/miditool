@@ -1,8 +1,8 @@
-"""Read a song's sections, tempo, and meter from its Songsterr tab.
+"""Read a song's sections, tempo, meter, and drums from its Songsterr tab.
 
-Songsterr supplies names, bar counts, tempo, and meter only. The drum
-notes in its tab are used to line its bars up with the MIDI's bars, not
-to replace the MIDI.
+The drum notes line the tab's bars up with the MIDI's bars. When asked,
+drums_to_midi() also turns them into a MIDI timeline that replaces the
+file's drums.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass, field
+from fractions import Fraction
 from pathlib import Path
 
 BROWSER = (
@@ -279,6 +280,37 @@ def read_measures(
     Returns one dict per played bar: meter, drum hits, marker text, and the
     tab measure it came from. Tempo marks are keyed by played bar.
     """
+    meters = measure_meters(measures)
+    tempo_by_measure: dict[int, float] = {}
+    for mark in tempo_marks:
+        try:
+            tempo_by_measure[int(mark.get("measure", 0))] = float(mark.get("bpm"))
+        except (TypeError, ValueError):
+            continue
+    order = play_order(measures)
+
+    bars: list[dict] = []
+    tempos: list[tuple[int, float]] = []
+    seen_tempo: set[int] = set()
+    for played, source in enumerate(order, start=1):
+        measure = measures[source]
+        hits = 0
+        if is_drums and not measure.get("rest"):
+            for voice in measure.get("voices") or []:
+                for beat in voice.get("beats") or []:
+                    hits += _beat_hits(beat)
+        marker = measure.get("marker") or {}
+        text = str(marker.get("text") or "").strip() if isinstance(marker, dict) else ""
+        if source in tempo_by_measure and source not in seen_tempo:
+            seen_tempo.add(source)
+            tempos.append((played, tempo_by_measure[source]))
+        bars.append({"meter": meters[source], "hits": hits, "marker": text, "source": source + 1})
+    if tempos and tempos[0][0] != 1:
+        tempos.insert(0, (1, tempos[0][1]))
+    return bars, tempos
+
+
+def measure_meters(measures: list[dict]) -> list[tuple[int, int]]:
     meters: list[tuple[int, int]] = []
     meter = (4, 4)
     for measure in measures:
@@ -286,13 +318,11 @@ def read_measures(
         if isinstance(signature, list) and len(signature) == 2 and signature[1]:
             meter = (int(signature[0]), int(signature[1]))
         meters.append(meter)
-    tempo_by_measure: dict[int, float] = {}
-    for mark in tempo_marks:
-        try:
-            tempo_by_measure[int(mark.get("measure", 0))] = float(mark.get("bpm"))
-        except (TypeError, ValueError):
-            continue
+    return meters
 
+
+def play_order(measures: list[dict]) -> list[int]:
+    """Tab measure indexes in the order the recording plays them, with repeats played out."""
     order: list[int] = []
     index = 0
     repeat_start = 0
@@ -326,26 +356,145 @@ def read_measures(
             passes[repeat_start] = 0
             repeat_start = index + 1
         index += 1
+    return order
 
-    bars: list[dict] = []
-    tempos: list[tuple[int, float]] = []
-    seen_tempo: set[int] = set()
-    for played, source in enumerate(order, start=1):
+
+# Guitar Pro drum sounds past the General MIDI kit, moved to the nearest GM drum.
+GP_EXTRA_DRUMS = {
+    91: 38, 92: 46, 93: 51, 94: 51, 95: 55, 96: 52, 97: 49, 98: 57,
+    99: 56, 100: 56, 101: 56, 102: 56, 103: 56, 104: 39, 105: 39,
+    106: 39, 107: 39, 108: 39, 109: 39, 126: 53, 127: 49,
+}
+DYNAMICS = {"ppp": 30, "pp": 45, "p": 60, "mp": 75, "mf": 88, "f": 100, "ff": 112, "fff": 124}
+
+
+@dataclass
+class TabDrums:
+    """The tab's drum part as a MIDI timeline at the caller's PPQ."""
+
+    part_name: str
+    ticks: list[list[int]]
+    bounds: list[int]
+    meters: list[tuple[int, int]]
+    tempos: list[tuple[int, int]]
+    sections: list[tuple[int, int, str]]
+    moved: dict[int, int]
+    dropped: dict[int, int]
+
+
+def drum_part(tab: Tab) -> tuple[dict, dict]:
+    """Download the drum part load_track() reads. Returns (meta, track)."""
+    meta = _json(f"{API}/meta/{tab.song_id}")
+    part = tab.drum_track
+    if part is None:
+        part = meta.get("popularTrackDrum")
+    if part is None:
+        part = next(
+            (index for index, track in enumerate(meta.get("tracks") or []) if track.get("instrumentId") == DRUM_INSTRUMENT),
+            None,
+        )
+    if part is None:
+        raise ValueError("Songsterr has no drum part for this song.")
+    base = f"{TRACK_HOST}/{tab.song_id}/{meta['revisionId']}/{meta['image']}"
+    track = _json(f"{base}/{part}.json")
+    if track.get("instrumentId") != DRUM_INSTRUMENT:
+        raise ValueError("Songsterr's drum part for this song is not a drum track.")
+    return meta, track
+
+
+def drums_to_midi(track: dict, ppq: int) -> TabDrums:
+    """Turn a Songsterr drum part into note, bar, meter, and tempo lists.
+
+    Repeats are played out like read_measures(). Each note's fret is its
+    drum number. Grace notes sit just before their beat and take no time
+    from the bar. Dynamics carry over from beat to beat; accents are
+    louder and ghost notes quieter.
+    """
+    measures = track.get("measures") or []
+    if not measures:
+        raise ValueError("Songsterr's drum part has no bars.")
+    meters = measure_meters(measures)
+    order = play_order(measures)
+    whole = 4 * ppq
+    tempo_by_measure: dict[int, float] = {}
+    for mark in (track.get("automations") or {}).get("tempo") or []:
+        try:
+            bpm = float(mark.get("bpm"))
+            unit = int(mark.get("type") or 4)
+            tempo_by_measure[int(mark.get("measure", 0))] = bpm * 4 / unit if unit in (1, 2, 4, 8, 16) else bpm
+        except (TypeError, ValueError):
+            continue
+
+    ticks: list[list[int]] = []
+    bounds: list[int] = [0]
+    bar_meters: list[tuple[int, int]] = []
+    tempos: list[tuple[int, int]] = []
+    moved: dict[int, int] = {}
+    dropped: dict[int, int] = {}
+    start = Fraction(0)
+    bpm = tempo_by_measure[min(tempo_by_measure)] if tempo_by_measure else 120.0
+    for played, source in enumerate(order):
         measure = measures[source]
-        hits = 0
-        if is_drums and not measure.get("rest"):
-            for voice in measure.get("voices") or []:
-                for beat in voice.get("beats") or []:
-                    hits += _beat_hits(beat)
-        marker = measure.get("marker") or {}
-        text = str(marker.get("text") or "").strip() if isinstance(marker, dict) else ""
-        if source in tempo_by_measure and source not in seen_tempo:
-            seen_tempo.add(source)
-            tempos.append((played, tempo_by_measure[source]))
-        bars.append({"meter": meters[source], "hits": hits, "marker": text, "source": source + 1})
-    if tempos and tempos[0][0] != 1:
-        tempos.insert(0, (1, tempos[0][1]))
-    return bars, tempos
+        meter = meters[source]
+        length = Fraction(meter[0], meter[1])
+        if played == 0 and track.get("anacrusis"):
+            filled = max(
+                (
+                    sum(Fraction(*beat["duration"]) for beat in voice.get("beats") or [] if not beat.get("graceNote"))
+                    for voice in measure.get("voices") or []
+                ),
+                default=length,
+            )
+            if 0 < filled < length:
+                length = filled
+        bpm = tempo_by_measure.get(source, bpm)
+        tempos.append((round(start * whole), round(60_000_000 / max(bpm, 1))))
+        for voice in measure.get("voices") or []:
+            position = Fraction(0)
+            dynamic = DYNAMICS["f"]
+            for beat in voice.get("beats") or []:
+                duration = Fraction(*beat.get("duration") or (0, 1))
+                if beat.get("velocity") in DYNAMICS:
+                    dynamic = DYNAMICS[beat["velocity"]]
+                grace = beat.get("graceNote")
+                at = position - min(duration, Fraction(1, 32)) if grace == "beforeBeat" else position
+                if not grace:
+                    position += duration
+                if beat.get("rest") or at >= length:
+                    continue
+                for note in beat.get("notes") or []:
+                    if note.get("rest") or note.get("tie") or note.get("dead") or "fret" not in note:
+                        continue
+                    drum = int(note["fret"])
+                    if drum in GP_EXTRA_DRUMS:
+                        moved[drum] = moved.get(drum, 0) + 1
+                        drum = GP_EXTRA_DRUMS[drum]
+                    elif not 27 <= drum <= 87:
+                        dropped[drum] = dropped.get(drum, 0) + 1
+                        continue
+                    velocity = dynamic
+                    if note.get("ghost"):
+                        velocity = round(velocity * 0.45)
+                    elif note.get("accentuated"):
+                        velocity += 27 if note["accentuated"] == 2 else 18
+                    if grace:
+                        velocity = round(velocity * 0.7)
+                    ticks.append([max(0, round((start + at) * whole)), drum, max(1, min(127, velocity))])
+        start += length
+        bounds.append(round(start * whole))
+        bar_meters.append(meter)
+    ticks.sort()
+    bars, _tempos = read_measures(measures, [], True)
+    return TabDrums(
+        part_name=part_name(str(track.get("name") or "Drums")),
+        ticks=ticks,
+        bounds=bounds,
+        meters=bar_meters,
+        tempos=tempos,
+        sections=sections_from(bars),
+        moved=moved,
+        dropped=dropped,
+    )
 
 
 def sections_from(bars: list[dict]) -> list[tuple[int, int, str]]:

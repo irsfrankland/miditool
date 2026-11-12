@@ -133,8 +133,9 @@ class SectionChart(ttk.Frame):
         self.canvas.configure(cursor="hand2", takefocus=True)
         self.canvas.bind("<Motion>", self._on_hover)
         self.canvas.bind("<Leave>", lambda _event: self._hide_pick())
-        self.canvas.bind("<MouseWheel>", self._on_wheel)
-        self.canvas.bind("<Shift-MouseWheel>", self._on_shift_wheel)
+        self.canvas.bind("<MouseWheel>", self._on_pan_wheel)
+        self.canvas.bind("<Shift-MouseWheel>", self._on_zoom_wheel)
+        self.canvas.bind("<Control-MouseWheel>", self._on_zoom_wheel)
         self.canvas.bind("<ButtonPress-1>", self._press)
         self.canvas.bind("<B1-Motion>", self._motion)
         self.canvas.bind("<ButtonRelease-1>", self._release)
@@ -197,11 +198,11 @@ class SectionChart(ttk.Frame):
         if self.on_zoom_changed is not None:
             self.on_zoom_changed()
 
-    def _on_wheel(self, event: tk.Event) -> str:
+    def _on_zoom_wheel(self, event: tk.Event) -> str:
         self.zoom(1 if event.delta > 0 else -1, event.x)
         return "break"
 
-    def _on_shift_wheel(self, event: tk.Event) -> str:
+    def _on_pan_wheel(self, event: tk.Event) -> str:
         self.canvas.xview_scroll(-3 if event.delta > 0 else 3, "units")
         return "break"
 

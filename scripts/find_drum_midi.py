@@ -1684,6 +1684,7 @@ class Finder:
         view["hits"] = hits_per_bar(view["ticks"], view["bounds"])
         view["lanes"], view["crashes"] = bar_lanes(view["ticks"], view["bounds"])
         view["tempo"] = chart.tempo_text(view["tempos"])
+        view["meter"] = brief_meters(chart.meter_text([(bar, *meter) for bar, meter in enumerate(view["meters"], start=1)]))
         self.meta["text"] = f"{view['tempo']}  ·  {view['meter']}  ·  {len(view['hits'])} measures  ·  {song_length(view['bar_ms'][-1] - view['bar_ms'][0])}"
 
     def chart_parts(self) -> list:
@@ -1711,7 +1712,10 @@ class Finder:
             self.lengths[key].set(str(end - start + 1))
         self._loading = False
 
-    SNAPSHOT_KEYS = ("ticks", "bounds", "tempos", "meters", "divisions", "parts", "tab_parts", "tab_shift", "tab_half", "bars_changed")
+    SNAPSHOT_KEYS = (
+        "ticks", "bounds", "tempos", "meters", "divisions", "parts", "tab_parts",
+        "tab_shift", "tab_half", "tab_sure", "tab_score", "bars_changed",
+    )
 
     def snapshot(self, label: str) -> dict:
         view = self.view
@@ -2944,6 +2948,8 @@ class Finder:
         self.tab_parts_check.configure(state="normal" if has_sections else "disabled")
         self.use_tab_button.configure(state="normal" if has_sections else "disabled")
         self.match_tempo_button.configure(state="normal" if ready and tab.bars else "disabled")
+        has_drums = ready and not self.busy and tab.best_part("drums") is not None
+        self.tab_drums_button.configure(state="normal" if has_drums else "disabled")
         if not ready:
             self.shift_label["text"] = ""
             if not keep_info:
@@ -3049,6 +3055,97 @@ class Finder:
             "Use Save MIDI to keep it."
         )
 
+    def on_use_tab_drums(self) -> None:
+        view, tab = self.view, self.tab
+        if not view or not tab or self.busy:
+            return
+        part = tab.best_part("drums")
+        if part is None:
+            self.set_status("Songsterr has no drum part for this song.")
+            return
+        if not messagebox.askyesno(
+            "Use Songsterr's drums",
+            f"Replace every note in this MIDI with Songsterr's {part.name} part?\n\n"
+            f"The song becomes the tab's {tab.count} bars (it has {len(view['hits'])} now), with the tab's meters and tempo, "
+            "and the ranges are set from its sections.\n\n"
+            "Undo brings this MIDI's drums back. Save MIDI writes the result.",
+            parent=self.root,
+        ):
+            return
+        key, ppq = view["key"], view["ppq"]
+        self.set_busy(True)
+        self.refresh_tab_panel(keep_info=True)
+        self.set_status("Reading Songsterr's drum part…")
+
+        def work() -> None:
+            try:
+                _meta, track = songsterr.drum_part(tab)
+                drums, error = songsterr.drums_to_midi(track, ppq), ""
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError, urllib.error.URLError) as exc:
+                drums, error = None, f"Songsterr's drum part could not be read ({exc})."
+            self.from_worker(lambda: self.finish_tab_drums(key, tab, drums, error))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def finish_tab_drums(self, key: str, tab: songsterr.Tab, drums: songsterr.TabDrums | None, error: str) -> None:
+        self.set_busy(False)
+        view = self.view
+        if view is not None and self.tab is not None:
+            self.refresh_tab_panel(keep_info=True)
+        if drums is None:
+            self.set_status(error)
+            return
+        if view is None or view["key"] != key:
+            self.set_status("Songsterr's drums arrived after you changed songs. Open the song again and retry.")
+            return
+        count = len(drums.bounds) - 1
+        if not drums.ticks:
+            self.set_status("Songsterr's drum part has no notes.")
+            return
+        sections = tab.sections if tab.count == count and tab.sections else drums.sections
+        self.remember("use Songsterr's drums")
+        self.stop(drop_audio=True)
+        self.pedal.reset()
+        view["ticks"] = drums.ticks
+        view["bounds"] = drums.bounds
+        view["tempos"] = midi_export.clean_tempos(drums.tempos)
+        view["meters"] = drums.meters
+        view["parts"] = suggest_sections.song_parts([tuple(item) for item in drums.ticks], drums.bounds)
+        view["tab_parts"] = list(sections)
+        view["tab_shift"] = 0
+        view["tab_half"] = False
+        view["tab_sure"] = True
+        view["tab_score"] = 1.0
+        view["bars_changed"] = True
+        notes: list[str] = []
+        try:
+            view["divisions"], notes = songsterr.divisions_from_sections(sections, count)
+            self.show_tab_parts.set(True)
+        except ValueError:
+            for name, (start, end) in view["divisions"].items():
+                start = min(max(1, start), count)
+                view["divisions"][name] = [start, min(max(start, end), count)]
+            notes.append("The tab has no sections, so the ranges were only trimmed to fit. Check them.")
+        self._loading = True
+        self.loop_on.set(False)
+        self.loop_start.set("")
+        self.loop_bars.set("")
+        self._loading = False
+        self.selection = None
+        self.chart.show_selection(None, None)
+        changed = []
+        if drums.moved:
+            changed.append(f"{sum(drums.moved.values())} Guitar Pro drum sounds were moved to the nearest standard drum")
+        if drums.dropped:
+            changed.append(f"{sum(drums.dropped.values())} notes with no drum sound were left out")
+        extra = (" " + ". ".join(changed) + ".") if changed else ""
+        self.edited(
+            f"Switched to Songsterr's {drums.part_name}: {count} bars, {len(drums.ticks)} hits.{extra} "
+            + " ".join(notes)
+            + " Undo brings the old drums back. Use Save MIDI to keep it."
+        )
+        self.refresh_tab_panel()
+
     def build_menus(self) -> None:
         def make() -> tk.Menu:
             return tk.Menu(
@@ -3138,6 +3235,7 @@ class Finder:
         tab.add_separator()
         self.use_tab_button = add(tab, "use_tab", "Use Songsterr sections", self.on_use_tab)
         self.match_tempo_button = add(tab, "match", "Match Songsterr tempo…", self.on_match_tempo)
+        self.tab_drums_button = add(tab, "tab_drums", "Use Songsterr's drums for the whole song…", self.on_use_tab_drums)
         tab.add_separator()
         tab.add_checkbutton(label="Play along with Songsterr in Chrome", variable=self.follow_chrome, command=self.on_follow_toggle)
         add(tab, "chrome_setup", "Set up Chrome…", self.chrome_setup)
@@ -3225,7 +3323,7 @@ class Finder:
             "• On the bars or the section names above them: click to pick a bar, drag to select bars, right-drag to add silent bars.\n"
             "• Play or Space starts from the selected bar.\n"
             "• Below the bars: click to clear the selection, drag to pan.\n"
-            "• Mouse wheel over the chart zooms at the pointer. Shift + wheel scrolls sideways.\n\n"
+            "• Mouse wheel over the chart pans left and right. Shift + wheel zooms at the pointer.\n\n"
             "Keys\n"
             "• Space plays and pauses.\n"
             "• Left and Right move the loop; Shift resizes it.\n"
