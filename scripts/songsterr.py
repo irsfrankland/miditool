@@ -215,6 +215,124 @@ def _is_drums(track: dict) -> bool:
 
 CACHE_DAYS = 7
 MISS_DAYS = 1
+ARTIST_COUNT = 1000
+
+
+def artist_matches(names: list[str], query: str, limit: int = 8) -> list[str]:
+    """Popularity order. A name that starts with the query comes before one that only contains it."""
+    text = query.strip().casefold()
+    if not text:
+        return []
+    starts = [name for name in names if name.casefold().startswith(text)]
+    contains = [name for name in names if text in name.casefold() and name not in starts]
+    found = starts + contains
+    if len(found) == 1 and found[0].casefold() == text:
+        return []
+    return found[:limit]
+
+
+def song_matches(
+    songs: list[tuple[str, str]], query: str, artist: str = "", limit: int = 8
+) -> list[str]:
+    """Titles from the popular list. With an artist already typed, only that artist's songs.
+
+    A label is "Title  ·  Artist" until the artist box narrows it to one artist.
+    """
+    text = query.strip().casefold()
+    wanted = artist.strip().casefold()
+    pool = songs
+    narrowed = False
+    if wanted:
+        exact = [item for item in songs if item[0].casefold() == wanted]
+        if exact:
+            pool, narrowed = exact, True
+        else:
+            prefixed = [item for item in songs if item[0].casefold().startswith(wanted)]
+            if len({item[0].casefold() for item in prefixed}) == 1:
+                pool, narrowed = prefixed, True
+    if not text and not narrowed:
+        return []
+    starts = [item for item in pool if not text or item[1].casefold().startswith(text)]
+    contains = [item for item in pool if text and text in item[1].casefold() and item not in starts]
+    found = (starts if text or narrowed else []) + contains
+    if text:
+        found = [item for item in found if text in item[1].casefold()]
+    labels = [item[1] if narrowed else f"{item[1]}  ·  {item[0]}" for item in found]
+    if len(labels) == 1 and labels[0].split("  ·  ")[0].casefold() == text:
+        return []
+    return labels[:limit]
+
+
+def popular_catalog(limit: int = ARTIST_COUNT) -> tuple[list[str], list[tuple[str, str]]]:
+    """Artists and songs from Songsterr's most-played list, in that order.
+
+    Reading stops once limit different artists have appeared. That is about
+    3,500 songs for the first 1,000 artists, and every one of those songs is kept.
+    """
+    artists: list[str] = []
+    seen_artists: set[str] = set()
+    songs: list[tuple[str, str]] = []
+    seen_songs: set[tuple[str, str]] = set()
+    start = 0
+    page = 100
+    while len(artists) < limit and start < limit * 8:
+        batch = _json(f"{API}/songs?size={page}&from={start}")
+        if not isinstance(batch, list) or not batch:
+            break
+        done = False
+        for song in batch:
+            if song.get("isJunk"):
+                continue
+            name = str(song.get("artist") or "").strip()
+            title = str(song.get("title") or "").strip()
+            if not name or not title:
+                continue
+            song_key = (name.casefold(), title.casefold())
+            if song_key not in seen_songs:
+                seen_songs.add(song_key)
+                songs.append((name, title))
+            artist_key = name.casefold()
+            if artist_key not in seen_artists:
+                seen_artists.add(artist_key)
+                artists.append(name)
+                if len(artists) >= limit:
+                    done = True
+                    break
+        start += len(batch)
+        if done or len(batch) < page:
+            break
+    return artists, songs
+
+
+def popular_catalog_cached(
+    folder: Path, limit: int = ARTIST_COUNT
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """popular_catalog(), remembered for CACHE_DAYS so the list is downloaded once."""
+    path = folder / "popular.json"
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        age_days = (time.time() - float(saved["saved"])) / 86400
+        artists = [str(name) for name in saved.get("artists") or [] if str(name).strip()]
+        songs = [
+            (str(item[0]).strip(), str(item[1]).strip())
+            for item in saved.get("songs") or []
+            if isinstance(item, (list, tuple)) and len(item) == 2 and str(item[0]).strip() and str(item[1]).strip()
+        ]
+        if artists and songs and age_days < CACHE_DAYS:
+            return artists[:limit], songs
+    except (OSError, ValueError, TypeError):
+        pass
+    artists, songs = popular_catalog(limit)
+    if artists and songs:
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps({"saved": time.time(), "artists": artists, "songs": songs}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+    return artists, songs
 
 
 def find_cached(artist: str, title: str, folder: Path) -> Tab | None:

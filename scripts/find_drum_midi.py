@@ -960,6 +960,141 @@ def styled_list(parent: tk.Misc) -> tk.Listbox:
     )
 
 
+class FieldComplete:
+    """A short list under an entry, filtered as the text is typed."""
+
+    def __init__(self, entry: ttk.Entry, choices, on_return, on_pick=None, tip: Tooltip | None = None) -> None:
+        self.entry = entry
+        self.choices = choices
+        self.on_return = on_return
+        self.on_pick = on_pick
+        self.tip = tip
+        self.popup: tk.Toplevel | None = None
+        self.listbox: tk.Listbox | None = None
+        self.hide_job: str | None = None
+        self.filling = False
+        entry.bind("<KeyRelease>", self._typed)
+        entry.bind("<Down>", self._down)
+        entry.bind("<Up>", self._up)
+        entry.bind("<Return>", self._return)
+        entry.bind("<Escape>", lambda _event: self.hide())
+        entry.bind("<FocusOut>", self._focus_out)
+
+    def _typed(self, event: tk.Event) -> None:
+        if self.filling or event.keysym in {
+            "Up", "Down", "Return", "Escape", "Tab", "Left", "Right",
+            "Shift_L", "Shift_R", "Control_L", "Control_R",
+        }:
+            return
+        self.show(self.choices())
+
+    def refresh(self) -> None:
+        if self.entry.focus_get() is self.entry:
+            self.show(self.choices())
+
+    def show(self, matches: list[str]) -> None:
+        if not matches:
+            self.hide()
+            return
+        if self.tip is not None:
+            self.tip._hide()
+        if self.popup is None:
+            self.popup = tk.Toplevel(self.entry)
+            self.popup.wm_overrideredirect(True)
+            self.popup.attributes("-topmost", True)
+            self.popup.configure(bg=LINE)
+            self.listbox = styled_list(self.popup)
+            self.listbox.configure(width=0)
+            self.listbox.pack(fill="both", expand=True)
+            self.listbox.bind("<ButtonPress-1>", self._keep)
+            self.listbox.bind("<ButtonRelease-1>", self._pick)
+        assert self.listbox is not None
+        self.listbox.delete(0, "end")
+        for name in matches:
+            self.listbox.insert("end", "  " + name)
+        self.listbox.configure(height=len(matches))
+        self.entry.update_idletasks()
+        line = tkfont.Font(name=UI_FONT, exists=True).metrics("linespace")
+        width = max(self.entry.winfo_width(), 180)
+        height = line * len(matches) + 4
+        x = self.entry.winfo_rootx()
+        y = self.entry.winfo_rooty() + self.entry.winfo_height()
+        self.popup.geometry(f"{width}x{height}+{x}+{y}")
+        self.popup.deiconify()
+        self.listbox.selection_clear(0, "end")
+        self.listbox.selection_set(0)
+        self.listbox.activate(0)
+
+    def hide(self) -> None:
+        if self.hide_job is not None:
+            self.entry.after_cancel(self.hide_job)
+            self.hide_job = None
+        if self.popup is not None:
+            self.popup.withdraw()
+
+    def _keep(self, _event: object) -> None:
+        if self.hide_job is not None:
+            self.entry.after_cancel(self.hide_job)
+            self.hide_job = None
+
+    def _focus_out(self, _event: tk.Event) -> None:
+        self.hide_job = self.entry.after(200, self.hide)
+
+    def _pick(self, event: tk.Event) -> str:
+        self._keep(None)
+        if self.listbox is not None:
+            index = self.listbox.nearest(event.y)
+            self.listbox.selection_clear(0, "end")
+            self.listbox.selection_set(index)
+        self._use()
+        return "break"
+
+    def _current(self) -> str:
+        if self.listbox is None or self.popup is None or not self.popup.winfo_viewable():
+            return ""
+        picked = self.listbox.curselection()
+        return self.listbox.get(picked[0]).strip() if picked else ""
+
+    def _use(self) -> bool:
+        name = self._current()
+        if not name:
+            return False
+        value = self.on_pick(name) if self.on_pick is not None else name
+        if not value:
+            value = name
+        self.filling = True
+        self.entry.delete(0, "end")
+        self.entry.insert(0, value)
+        self.filling = False
+        self.hide()
+        self.entry.focus_set()
+        return True
+
+    def _move(self, step: int) -> str:
+        if not self._current():
+            return "break"
+        assert self.listbox is not None
+        index = max(0, min(self.listbox.size() - 1, self.listbox.curselection()[0] + step))
+        self.listbox.selection_clear(0, "end")
+        self.listbox.selection_set(index)
+        self.listbox.activate(index)
+        return "break"
+
+    def _down(self, _event: tk.Event) -> str:
+        if not self._current():
+            self.show(self.choices())
+            return "break"
+        return self._move(1)
+
+    def _up(self, _event: tk.Event) -> str:
+        return self._move(-1)
+
+    def _return(self, _event: tk.Event) -> str:
+        if not self._use():
+            self.on_return()
+        return "break"
+
+
 def styled_tree(parent: tk.Misc) -> ttk.Treeview:
     return ttk.Treeview(parent, style="Songs.Treeview", show="tree", selectmode="browse")
 
@@ -1308,11 +1443,29 @@ class Finder:
         ttk.Label(find, text="Artist", style="Section.TLabel").grid(row=0, column=0, sticky="w")
         self.artist = ttk.Entry(find)
         self.artist.grid(row=1, column=0, sticky="ew", pady=(2, 6))
+        self.artist_names: list[str] = []
+        self.popular_songs: list[tuple[str, str]] = []
+        artist_tip = Tooltip(
+            self.artist,
+            "Songsterr's most played artists. Type a few letters, then click a name or press Enter.",
+        )
+        self.artist_complete = FieldComplete(
+            self.artist, lambda: songsterr.artist_matches(self.artist_names, self.artist.get()), self.on_search, tip=artist_tip
+        )
         ttk.Label(find, text="Song title", style="Section.TLabel").grid(row=2, column=0, sticky="w")
         self.title = ttk.Entry(find)
         self.title.grid(row=3, column=0, sticky="ew", pady=(2, 6))
-        for entry in (self.artist, self.title):
-            entry.bind("<Return>", lambda _event: self.on_search())
+        title_tip = Tooltip(
+            self.title,
+            "Songsterr's most played songs. With an artist filled in, only that artist's songs are offered.",
+        )
+        self.title_complete = FieldComplete(
+            self.title,
+            lambda: songsterr.song_matches(self.popular_songs, self.title.get(), self.artist.get()),
+            self.on_search,
+            self.pick_song,
+            title_tip,
+        )
         self.use_midifind = tk.BooleanVar(value=True)
         self.use_midiworld = tk.BooleanVar(value=True)
         sites = ttk.Frame(find)
@@ -1442,12 +1595,37 @@ class Finder:
         self.reload_songs()
         self.refresh_buttons()
         self.refresh_transport()
+        threading.Thread(target=self.load_popular, daemon=True).start()
         first = next(iter(self.song_iids.values()), None)
         if first:
             self.saved_list.selection_set(first)
             self.saved_list.focus(first)
             self.saved_list.see(first)
             self.on_saved()
+
+    def load_popular(self) -> None:
+        """Songsterr's most played artists and the songs they came from. Cached after the first download."""
+        try:
+            artists, songs = songsterr.popular_catalog_cached(SONGSTERR_CACHE)
+        except (OSError, ValueError, urllib.error.URLError):
+            artists, songs = [], []
+        self.from_worker(lambda: self.show_popular(artists, songs))
+
+    def show_popular(self, artists: list[str], songs: list[tuple[str, str]]) -> None:
+        self.artist_names = artists
+        self.popular_songs = songs
+        self.artist_complete.refresh()
+        self.title_complete.refresh()
+
+    def pick_song(self, label: str) -> str:
+        """A song choice fills the title, and the artist when the label names one."""
+        title, _mark, artist = label.partition("  ·  ")
+        if artist:
+            self.artist_complete.filling = True
+            self.artist.delete(0, "end")
+            self.artist.insert(0, artist)
+            self.artist_complete.filling = False
+        return title
 
     def chosen_sites(self) -> list[str]:
         sites = []
