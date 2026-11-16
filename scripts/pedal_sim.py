@@ -17,12 +17,14 @@ drums and tells the machine when a bar or a range finishes.
 
 from __future__ import annotations
 
+import sys
 import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
 
-IMAGE = Path(__file__).resolve().parents[1] / "assets" / "rc10r-pedal.png"
+_BASE = Path(getattr(sys, "_MEIPASS", "") or Path(__file__).resolve().parents[1])
+IMAGE = _BASE / "assets" / "rc10r-pedal.png"
 CODES = {
     "idle": "---",
     "intro": "INT",
@@ -155,6 +157,10 @@ class PedalMachine:
         self.note = ""
         track = self.track
         if self.loop == "off":
+            if not self.tracks[track] and self.now is None:
+                # The looper is silent here: it measures takes against the drums' bars.
+                self.note = "START RHYTHM"
+                return "loop"
             self.loop = "play" if self.tracks[track] else "rec"
             if self.loop == "rec":
                 self._begin_rec(track)
@@ -230,8 +236,7 @@ class PedalMachine:
         self.length = {1: 0, 2: 0}
         self.result = ""
         self.track = 1
-        if self.state == "idle":
-            self.loop = "off"
+        self.loop = "off"
 
     # Loop timing, counted in bars played since Start along the pedal's path
 
@@ -258,6 +263,11 @@ class PedalMachine:
         start = self.rec_start[track]
         self.rec_start[track] = None
         if start is None or self.now is None:
+            # No drums were counting bars, so there is no length to keep.
+            self.tracks[track] = False
+            self.length[track] = 0
+            self.loop = "off"
+            self.result = f"TRK {track} was not kept: the drums were not playing while it recorded."
             return
         elapsed = self.now - start
         bars = max(1, round(elapsed))
@@ -495,9 +505,11 @@ class Switch:
         self.hold_job: str | None = None
         self.tap_job: str | None = None
         self.held = False
+        self.pressed_at = 0.0
 
     def press(self) -> None:
         self.held = False
+        self.pressed_at = time.perf_counter()
         self.on_press()
         self.hold_job = self.widget.after(self.HOLD_MS, self._hold)
 
@@ -526,6 +538,12 @@ class Switch:
     def _tap(self) -> None:
         self.tap_job = None
         self.on_tap()
+
+    def cancel(self) -> None:
+        for job in (self.hold_job, self.tap_job):
+            if job is not None:
+                self.widget.after_cancel(job)
+        self.hold_job = self.tap_job = None
 
 
 class PedalWindow:
@@ -599,20 +617,23 @@ class PedalWindow:
             name: self.canvas.create_oval(x - r, y - r, x + r, y + r, outline="", width=4)
             for name, (x, y) in self.SWITCHES.items()
         }
+        # A tap is only known once the double-press window has passed, so taps and
+        # double presses carry the time the pad went down.
+        self.press_at: float | None = None
         self.switches = {
             "loop": Switch(
                 self.window,
-                lambda: controls["loop_tap"](),
+                lambda: self._fire("loop", controls["loop_tap"]),
                 lambda: controls["loop_hold"](),
-                lambda: controls["loop_double"](),
+                lambda: self._fire("loop", controls["loop_double"]),
                 lambda: self._glow("loop", True),
                 lambda: self._glow("loop", False),
             ),
             "rhythm": Switch(
                 self.window,
-                lambda: controls["rhythm_tap"](),
+                lambda: self._fire("rhythm", controls["rhythm_tap"]),
                 lambda: controls["rhythm_hold"](),
-                lambda: controls["rhythm_double"](),
+                lambda: self._fire("rhythm", controls["rhythm_double"]),
                 lambda: self._glow("rhythm", True),
                 lambda: self._glow("rhythm", False),
             ),
@@ -635,7 +656,7 @@ class PedalWindow:
             y = 130 + row * 76
             self.canvas.create_text(middle_x, y, text=heading, fill="#c9c7c0", font=("Segoe UI", 9, "bold"))
             for column, (key, text) in enumerate(zip(keys, ("Press", "Hold 2 s", "Press twice"))):
-                button = ttk.Button(self.canvas, text=text, command=controls[key], width=11)
+                button = ttk.Button(self.canvas, text=text, command=controls[key], width=11, takefocus=False)
                 self.canvas.create_window(side + spacing * (column + 0.5), y + 30, window=button)
                 self.buttons[key] = button
 
@@ -645,12 +666,15 @@ class PedalWindow:
             text="SYNC the loop with the rhythm (light blue)",
             variable=self.sync_var,
             command=lambda: controls["sync"](self.sync_var.get()),
+            takefocus=False,
         )
         self.canvas.create_window(side + 4, 296, window=sync, anchor="w")
         self.sync_box = sync
-        clear = ttk.Button(self.canvas, text="Clear loops", command=controls["clear"], width=12)
+        clear = ttk.Button(self.canvas, text="Clear loops", command=controls["clear"], width=12, takefocus=False)
         self.canvas.create_window(middle_x - 66, 336, window=clear)
-        stop = ttk.Button(self.canvas, text="Stop all", command=controls["stop"], width=12, style="Accent.TButton")
+        stop = ttk.Button(
+            self.canvas, text="Stop all", command=controls["stop"], width=12, style="Accent.TButton", takefocus=False
+        )
         self.canvas.create_window(middle_x + 66, 336, window=stop)
 
         self.waiting = self.canvas.create_text(
@@ -711,6 +735,13 @@ class PedalWindow:
 
     def _mouse_move(self, event) -> None:
         self.canvas.configure(cursor="hand2" if self._pad_at(event.x, event.y) else "")
+
+    def _fire(self, name: str, control) -> None:
+        self.press_at = self.switches[name].pressed_at
+        try:
+            control()
+        finally:
+            self.press_at = None
 
     def _glow(self, name: str, on: bool) -> None:
         self.canvas.itemconfigure(self.pad_glow[name], outline=AMBER if on else "")
@@ -797,6 +828,8 @@ class PedalWindow:
         if self.pulse_job is not None:
             self.window.after_cancel(self.pulse_job)
             self.pulse_job = None
+        for switch in self.switches.values():
+            switch.cancel()
         try:
             self.on_close()
         finally:

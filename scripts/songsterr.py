@@ -8,6 +8,7 @@ file's drums.
 from __future__ import annotations
 
 import gzip
+import http.client
 import json
 import re
 import time
@@ -130,8 +131,12 @@ def same_title(left: str, right: str) -> bool:
 
 def _get(url: str, timeout: int = 15) -> bytes:
     request = urllib.request.Request(url, headers={"User-Agent": BROWSER})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        data = response.read()
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = response.read()
+    except http.client.HTTPException as exc:
+        # A dropped connection (IncompleteRead) is neither an OSError nor a ValueError.
+        raise OSError(f"the connection broke ({exc!r})") from exc
     if data[:2] == b"\x1f\x8b":
         data = gzip.decompress(data)
     return data
@@ -156,7 +161,7 @@ def find(artist: str, title: str, with_track: bool = True) -> Tab | None:
     if tab is not None and with_track:
         try:
             load_track(tab)
-        except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError) as exc:
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             tab.error = f"Songsterr's tab data could not be read ({exc})."
     return tab
 
@@ -318,9 +323,9 @@ def popular_catalog_cached(
             for item in saved.get("songs") or []
             if isinstance(item, (list, tuple)) and len(item) == 2 and str(item[0]).strip() and str(item[1]).strip()
         ]
-        if artists and songs and age_days < CACHE_DAYS:
+        if artists and songs and 0 <= age_days < CACHE_DAYS:
             return artists[:limit], songs
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
         pass
     artists, songs = popular_catalog(limit)
     if artists and songs:
@@ -349,7 +354,7 @@ def find_cached(artist: str, title: str, folder: Path) -> Tab | None:
             return None
         if saved.get("tab") is not None and age_days < CACHE_DAYS:
             return _tab_from(saved["tab"])
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
         pass
     tab = find(artist, title)
     if tab is None or not tab.error:
@@ -432,7 +437,6 @@ def read_measures(
 
     bars: list[dict] = []
     tempos: list[tuple[int, float]] = []
-    seen_tempo: set[int] = set()
     for played, source in enumerate(order, start=1):
         measure = measures[source]
         hits = 0
@@ -442,8 +446,8 @@ def read_measures(
                     hits += _beat_hits(beat)
         marker = measure.get("marker") or {}
         text = str(marker.get("text") or "").strip() if isinstance(marker, dict) else ""
-        if source in tempo_by_measure and source not in seen_tempo:
-            seen_tempo.add(source)
+        # A repeat plays its tempo marks again on every pass.
+        if source in tempo_by_measure and (not tempos or tempos[-1][1] != tempo_by_measure[source]):
             tempos.append((played, tempo_by_measure[source]))
         bars.append({"meter": meters[source], "hits": hits, "marker": text, "source": source + 1})
     if tempos and tempos[0][0] != 1:

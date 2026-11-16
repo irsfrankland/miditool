@@ -24,6 +24,8 @@ import sys
 import threading
 import time
 import tkinter as tk
+import traceback
+import unicodedata
 import winsound
 import urllib.error
 import urllib.parse
@@ -44,10 +46,20 @@ import suggest_sections
 from pedal_sim import PedalMachine, PedalWindow
 from preview_ui import ROLE, SectionChart, bar_lanes, render_section
 
-ROOT = Path(__file__).resolve().parents[1]
-ARTWORK = ROOT / "artwork"
-ICON = ROOT / "assets" / "drum-finder.ico"
-INCOMING = ROOT / "incoming"
+FROZEN = bool(getattr(sys, "frozen", False))
+if FROZEN:
+    # The packaged .exe: read-only files (icon, Chrome helper) sit beside it,
+    # and everything the app writes goes to the user's own folders.
+    BUNDLE = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    ROOT = Path.home() / "Documents" / "MidiTool"
+    _APP_DATA = Path(os.environ.get("LOCALAPPDATA") or ROOT) / "MidiTool"
+else:
+    BUNDLE = Path(__file__).resolve().parents[1]
+    ROOT = BUNDLE
+    _APP_DATA = ROOT
+ARTWORK = _APP_DATA / "artwork"
+ICON = BUNDLE / "assets" / "drum-finder.ico"
+INCOMING = _APP_DATA / "incoming"
 ALLOWED_HOSTS = {"midifind.com", "www.midifind.com", "midiworld.com", "www.midiworld.com"}
 BROWSER = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -200,22 +212,40 @@ def search(artist: str, song: str, sites: list[str]) -> tuple[list[Hit], str]:
     web = Web()
     notes: list[str] = []
     hits: list[Hit] = []
-    if "MIDIfind" in sites:
+    failed: list[str] = []
+
+    def attempt(site: str, run: Callable[[], None]) -> None:
+        try:
+            run()
+        except Exception as exc:
+            failed.append(f"{site} ({exc})")
+
+    def midifind() -> None:
         found, more = search_midifind(web, query)
         hits.extend(found)
         if len(query) > 30:
             notes.append("MIDIfind only accepts 30 characters, so that search was shortened.")
         if more:
             notes.append("MIDIfind has another page. Add a word and search again.")
-    if "MIDIWORLD" in sites:
+
+    def midiworld() -> None:
         # MIDIWORLD lists a song as "Title (Artist)", so the song title matches.
         # The artist still moves the closer files to the top.
         found, more = search_midiworld(web, song.strip() or query)
         hits.extend(found)
         if more:
             notes.append("MIDIWORLD has another page. Add a word and search again.")
+
+    if "MIDIfind" in sites:
+        attempt("MIDIfind", midifind)
+    if "MIDIWORLD" in sites:
+        attempt("MIDIWORLD", midiworld)
     if "Songsterr" in sites:
-        hits.extend(search_songsterr(query))
+        attempt("Songsterr", lambda: hits.extend(search_songsterr(query)))
+    if failed and len(failed) == len(sites):
+        raise RuntimeError("The search failed: " + "; ".join(failed))
+    if failed:
+        notes.append("Could not search " + "; ".join(failed) + ".")
     hits.sort(key=lambda hit: rank(hit.title, artist, song), reverse=True)
     return hits, " ".join(notes)
 
@@ -278,6 +308,8 @@ def save_midi(web: Web, hit: Hit) -> Path:
 def song_id(title: str) -> str:
     text = re.sub(r"['\u2018\u2019]", "", title.lower())
     slug = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+    if not slug:
+        slug = re.sub(r"[\W_]+", "-", text).strip("-")
     return slug or "song"
 
 
@@ -334,6 +366,7 @@ SETTINGS_PATH = Path(os.environ.get("APPDATA") or ROOT) / "MidiTool" / "finder-s
 LOCAL_DATA = Path(os.environ.get("LOCALAPPDATA") or ROOT) / "MidiTool"
 SONGSTERR_CACHE = LOCAL_DATA / "songsterr"
 PREVIEWS = LOCAL_DATA / "previews"
+ERROR_LOG = LOCAL_DATA / "errors.log"
 KEEP_PREVIEWS = 4
 KEEP_SESSIONS = 20
 MIDI_SUFFIXES = {".mid", ".midi", ".kar"}
@@ -355,7 +388,33 @@ def load_settings() -> dict:
 
 def save_settings(settings: dict) -> None:
     SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SETTINGS_PATH.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    write_atomic(SETTINGS_PATH, (json.dumps(settings, indent=2) + "\n").encode("utf-8"))
+
+
+def write_atomic(path: Path, data: bytes) -> None:
+    """Write through a temporary file so a crash or a OneDrive lock never leaves half a file."""
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_bytes(data)
+    for attempt in range(5):
+        try:
+            os.replace(temp, path)
+            return
+        except PermissionError:
+            if attempt == 4:
+                temp.unlink(missing_ok=True)
+                raise
+            time.sleep(0.1)
+
+
+def log_error(exc_type: type[BaseException], exc: BaseException, tb: object) -> None:
+    """Keep a traceback in errors.log. pythonw has no console to show it."""
+    try:
+        ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
+        text = "".join(traceback.format_exception(exc_type, exc, tb))
+        with ERROR_LOG.open("a", encoding="utf-8") as log:
+            log.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')}\n{text}\n")
+    except OSError:
+        pass
 
 
 def clean_name(text: str) -> str:
@@ -415,7 +474,9 @@ def short_path(path: Path) -> str:
 
 
 def artist_key(name: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", name.casefold())
+    decomposed = unicodedata.normalize("NFKD", name.casefold())
+    folded = "".join(char for char in decomposed if not unicodedata.combining(char))
+    return re.sub(r"[^a-z0-9]", "", folded) or re.sub(r"[\W_]", "", folded)
 
 
 def same_file(a: Path, b: Path) -> bool:
@@ -503,8 +564,12 @@ def lookup_songsterr(artist: str, title: str) -> tuple[songsterr.Tab | None, str
     """The Songsterr tab with its sections, or None and a reason."""
     try:
         return songsterr.find_cached(artist, title, SONGSTERR_CACHE), ""
-    except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError) as exc:
+    except OSError as exc:
         return None, f"Songsterr could not be reached ({exc})."
+    except Exception as exc:
+        # Workers wait on this answer, so an odd reply must not escape.
+        log_error(type(exc), exc, exc.__traceback__)
+        return None, f"Songsterr sent something this finder cannot read ({exc})."
 
 
 def tempo_at(tempos: list[tuple[int, int]], tick: int) -> int:
@@ -646,7 +711,7 @@ def typing_lines(divisions: dict[str, list[int]]) -> list[str]:
 
 
 def load_catalog(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
 def format_catalog(catalog: dict, newline: str = "\n") -> str:
@@ -661,7 +726,7 @@ def format_catalog(catalog: dict, newline: str = "\n") -> str:
 
 def write_catalog(path: Path, catalog: dict) -> None:
     newline = "\r\n" if path.is_file() and b"\r\n" in path.read_bytes() else "\n"
-    path.write_bytes(format_catalog(catalog, newline).encode("utf-8"))
+    write_atomic(path, format_catalog(catalog, newline).encode("utf-8"))
 
 
 def song_entry(
@@ -670,10 +735,11 @@ def song_entry(
     relative: str,
     divisions: dict[str, list[int]],
     notes: list[str],
+    slug: str | None = None,
 ) -> dict:
     cleaned = [note.strip() for note in notes if note.strip()]
     return {
-        "id": song_id(title),
+        "id": slug or song_id(title),
         "title": title,
         "artist": artist,
         "file": relative,
@@ -711,14 +777,14 @@ def add_to_list(
     *,
     catalog_path: Path = chart.MAP_PATH,
     drum_root: Path | None = None,
-) -> str:
+) -> tuple[str, str]:
+    """Add or replace a song. Returns the report and the song's id in the list."""
     artist = artist.strip()
     title = title.strip()
     if not artist or not title:
         raise ValueError("Enter the artist and the song title.")
-    slug = song_id(title)
-    previous = catalog_path.read_bytes()
-    catalog = json.loads(previous.decode("utf-8"))
+    catalog = load_catalog(catalog_path)
+    slug = list_id(catalog, artist, title)
     if chart.is_locked(slug, catalog):
         raise ValueError(
             f"{title} is already in the song list with fixed ranges. This finder will not replace it."
@@ -728,7 +794,7 @@ def add_to_list(
     relative, dest, created = place_midi(src, artist, root)
     if extra_note.strip():
         notes.append(extra_note.strip())
-    entry = song_entry(artist, title, relative, divisions, notes)
+    entry = song_entry(artist, title, relative, divisions, notes, slug)
     replaced = False
     for index, current in enumerate(catalog["songs"]):
         if current["id"] == slug:
@@ -740,16 +806,36 @@ def add_to_list(
     try:
         write_catalog(catalog_path, catalog)
     except Exception:
-        catalog_path.write_bytes(previous)
         if created and dest.exists():
             dest.unlink()
         raise
     verb = "Replaced" if replaced else "Added"
-    return (
+    report = (
         f"{verb} {artist} — {title} in the song list.\n"
         f"File: {dest}\n"
         + "\n".join(typing_lines(divisions))
     )
+    return report, slug
+
+
+def list_id(catalog: dict, artist: str, title: str) -> str:
+    """The id for this song: the entry it replaces, or a new id that no other song uses.
+
+    Ids come from the title, so a different song that slugs the same (another
+    artist's "Intro", or titles with no Latin letters) gets the artist added.
+    """
+    base = song_id(title)
+    taken = {song.get("id"): song for song in catalog.get("songs", [])}
+    candidates = [base, f"{base}-{song_id(artist)}"]
+    candidates += [f"{candidates[1]}-{n}" for n in range(2, 100)]
+    for slug in candidates:
+        current = taken.get(slug)
+        if current is None:
+            return slug
+        same_artist = artist_key(current.get("artist", "")) == artist_key(artist)
+        if same_artist and song_id(current.get("title", "")) == base:
+            return slug
+    raise ValueError("Too many songs share this title.")
 
 
 _FONTS: dict[str, tkfont.Font] = {}
@@ -1292,6 +1378,8 @@ class Finder:
         except Exception:
             pass
         self.root = tk.Tk()
+        self.root.report_callback_exception = self.on_error
+        threading.excepthook = lambda args: log_error(args.exc_type, args.exc_value, args.exc_traceback)
         self.root.title("Drum MIDI finder")
         if ICON.is_file():
             self.root.iconbitmap(default=str(ICON))
@@ -1384,7 +1472,10 @@ class Finder:
             bar.add(ttk.Menubutton(bar, text=label, menu=menu, style="Menu.TMenubutton"))
 
         def tool(text: str, command, accent: bool = False, space: int = 0, tip: str = "") -> ttk.Button:
-            button = ttk.Button(bar, text=text, command=command, style="SmallAccent.TButton" if accent else "Small.TButton")
+            # No focus on click, or Space would press the button and also play or pause.
+            button = ttk.Button(
+                bar, text=text, command=command, style="SmallAccent.TButton" if accent else "Small.TButton", takefocus=False
+            )
             bar.add(button, space)
             if tip:
                 Tooltip(button, tip)
@@ -1394,7 +1485,7 @@ class Finder:
         self.pause_button = tool("Pause", self.on_pause_button)
         tool("Stop", self.on_stop)
         loop = ttk.Frame(bar)
-        ttk.Checkbutton(loop, text="Loop", variable=self.loop_on, command=self.on_loop_toggle).pack(side="left")
+        ttk.Checkbutton(loop, text="Loop", variable=self.loop_on, command=self.on_loop_toggle, takefocus=False).pack(side="left")
         self.loop_start_entry = ttk.Entry(loop, textvariable=self.loop_start, width=4)
         self.loop_start_entry.pack(side="left", padx=(6, 0))
         ttk.Label(loop, text="×", style="Muted.TLabel").pack(side="left", padx=4)
@@ -1529,6 +1620,18 @@ class Finder:
             "<Configure>",
             lambda event: self.tab_info.configure(wraplength=max(240, event.width - self.chrome_slot_frame.winfo_reqwidth() - 24)),
         )
+        # Line-up arrows just above the chart, so the tab can be nudged one
+        # bar at a time without opening the Songsterr menu.
+        shift_row = ttk.Frame(info)
+        shift_row.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.chart_shift_down = ttk.Button(shift_row, text="◀", width=3, command=lambda: self.on_shift(-1), state="disabled")
+        self.chart_shift_down.pack(side="left")
+        self.chart_shift_up = ttk.Button(shift_row, text="▶", width=3, command=lambda: self.on_shift(1), state="disabled")
+        self.chart_shift_up.pack(side="left", padx=(4, 0))
+        self.chart_shift_label = ttk.Label(shift_row, text="Songsterr line-up", style="Muted.TLabel")
+        self.chart_shift_label.pack(side="left", padx=(8, 0))
+        Tooltip(self.chart_shift_down, "Move the Songsterr tab one bar earlier")
+        Tooltip(self.chart_shift_up, "Move the Songsterr tab one bar later")
         for entry in (self.loop_start_entry, self.loop_bars_entry):
             entry.bind("<FocusOut>", self.on_loop_fields)
             entry.bind("<Return>", self.on_loop_fields)
@@ -1617,7 +1720,10 @@ class Finder:
         """Songsterr's most played artists and the songs they came from. Cached after the first download."""
         try:
             artists, songs = songsterr.popular_catalog_cached(SONGSTERR_CACHE)
-        except (OSError, ValueError, urllib.error.URLError):
+        except OSError:
+            artists, songs = [], []
+        except Exception as exc:
+            log_error(type(exc), exc, exc.__traceback__)
             artists, songs = [], []
         self.from_worker(lambda: self.show_popular(artists, songs))
 
@@ -1664,9 +1770,25 @@ class Finder:
     def set_status(self, text: str) -> None:
         self.status["text"] = text
 
+    def on_error(self, exc_type: type[BaseException], exc: BaseException, tb: object) -> None:
+        log_error(exc_type, exc, tb)
+        if hasattr(self, "status"):
+            self.set_status(f"Something went wrong ({exc_type.__name__}: {exc}). Details are in {ERROR_LOG}.")
+
     def reload_songs(self) -> None:
-        self.catalog = load_catalog(chart.ensure_song_list())
-        self.songs = list(self.catalog["songs"])
+        try:
+            catalog = load_catalog(chart.ensure_song_list())
+            songs = list(catalog["songs"])
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            # Keep what was shown and never write over the file the user can still fix.
+            message = f"The song list {chart.MAP_PATH} could not be read: {exc}"
+            self.root.after_idle(lambda: self.set_status(message))
+            if self.catalog:
+                return
+            catalog = {**chart.BLANK_LIST, "songs": []}
+            songs = []
+        self.catalog = catalog
+        self.songs = songs
         tree = self.saved_list
         children = tree.get_children("")
         closed = {iid for iid in children if not tree.item(iid, "open")}
@@ -1748,15 +1870,19 @@ class Finder:
         if not path.is_file():
             self.set_status(f"Missing MIDI file: {path}")
             return
+        try:
+            self.show_file(
+                path,
+                song["artist"],
+                song["title"],
+                {key: list(span) for key, span in song["divisions"].items()},
+                editable=False,
+                summary="Saved in the song list. Type these into Rhythm Converter. Intro and the ending play once. Patterns and fills loop.",
+            )
+        except (OSError, ValueError) as exc:
+            self.set_status(f"{path.name} could not be read: {exc}")
+            return
         self.results.selection_clear(0, "end")
-        self.show_file(
-            path,
-            song["artist"],
-            song["title"],
-            {key: list(span) for key, span in song["divisions"].items()},
-            editable=False,
-            summary="Saved in the song list. Type these into Rhythm Converter. Intro and the ending play once. Patterns and fills loop.",
-        )
         self.view["song_id"] = song["id"]
 
     def show_file(
@@ -1769,14 +1895,31 @@ class Finder:
         summary: str,
         midi: dict | None = None,
     ) -> bool:
-        """Show a song. Returns True when it was open before and comes back as it was left."""
+        """Show a song. Returns True when it was open before and comes back as it was left.
+
+        The file is read before the open song is put away, so a file that cannot
+        be read leaves the open song as it was and raises.
+        """
+        key = session_key(path, editable)
+
+        def read() -> tuple:
+            data = midi if midi is not None else chart.parse_midi(path)
+            hits, meters, boundaries = chart.build_measures(data)
+            parts = suggest_sections.song_parts(data["events"], boundaries)
+            kit, kit_reason = suggest_sections.recommend_kit(data, artist, title, meters)
+            tempo = chart.tempo_text(data["tempos"])
+            meter = brief_meters(chart.meter_text(meters))
+            return data, hits, meters, boundaries, parts, kit, kit_reason, tempo, meter
+
+        stored = self.sessions.get(key)
+        fresh = read() if stored is None or stored["stamp"] != file_stamp(path) else None
         self.park_view()
         self.stop(drop_audio=True)
         self.pedal.stop_all()
         self.pedal.clear_tracks()
         self.chrome_played = None
         self.chrome_mark = None
-        key = session_key(path, editable)
+        self.chrome_good = None
         session = self.sessions.pop(key, None)
         if session is not None and session["stamp"] == file_stamp(path):
             self.resume_session(session)
@@ -1784,13 +1927,7 @@ class Finder:
             if self.link_tab is None:
                 self.request_songsterr(self.view["artist"], self.view["title"])
             return True
-        if midi is None:
-            midi = chart.parse_midi(path)
-        hits, meters, boundaries = chart.build_measures(midi)
-        parts = suggest_sections.song_parts(midi["events"], boundaries)
-        kit, kit_reason = suggest_sections.recommend_kit(midi, artist, title, meters)
-        tempo = chart.tempo_text(midi["tempos"])
-        meter = brief_meters(chart.meter_text(meters))
+        midi, hits, meters, boundaries, parts, kit, kit_reason, tempo, meter = fresh or read()
         self.view = {
             "path": path,
             "artist": artist,
@@ -2052,6 +2189,8 @@ class Finder:
         threading.Thread(target=work, daemon=True).start()
 
     def poll_covers(self) -> None:
+        # Scheduled first so one failing result cannot stop every later one.
+        self.root.after(50, self.poll_covers)
         try:
             while True:
                 token, found = self.cover_queue.get_nowait()
@@ -2069,7 +2208,6 @@ class Finder:
                 self.worker_calls.get_nowait()()
         except queue.Empty:
             pass
-        self.root.after(50, self.poll_covers)
 
     def from_worker(self, call: Callable[[], None]) -> None:
         """Run call on the Tk thread. Tk must not be touched from a worker thread."""
@@ -2169,7 +2307,8 @@ class Finder:
         ):
             self.set_status("Search cancelled.")
             return
-        self.request_songsterr(artist, song)
+        # Only warm the tab cache. The open song keeps its own Songsterr tab.
+        threading.Thread(target=lookup_songsterr, args=(artist, song), daemon=True).start()
         self.set_busy(True)
         self.set_status(f"Searching {site_text}…")
         threading.Thread(target=self.search_worker, args=(artist, song, sites), daemon=True).start()
@@ -2632,6 +2771,7 @@ class Finder:
     def start_failed(self) -> None:
         self.pending_start = None
         self.pending_follow = False
+        self.pending_pedal = False
         self.follow_retry_at = time.time() + 3
 
     def finish_start(self) -> None:
@@ -2667,8 +2807,9 @@ class Finder:
             self.pending_follow = False
             self.playing["follow"] = True
             self.playing["synced_mark"] = self.chrome_mark
-        if self.pending_pedal:
-            self.pending_pedal = False
+        pedal = self.pending_pedal and self.pedal.state != "idle"
+        self.pending_pedal = False
+        if pedal:
             start, end = self.pedal.span(self.pedal.state)
             self.playing["pedal"] = True
             self.playing["segment"] = (view["bar_ms"][start - 1], view["bar_ms"][end])
@@ -2700,21 +2841,25 @@ class Finder:
         loop = state.get("loop")
         song_end = self.view["bar_ms"][-1]
         if loop and position >= loop[1]:
+            # Land as far into the loop as the timer was late, so every pass keeps its length.
+            late = position - loop[1]
+            target = float(loop[0]) + (late if late < loop[1] - loop[0] else 0.0)
             try:
-                play_at(loop[0] - state["file_start"])
+                play_at(round(target) - state["file_start"])
             except Exception as exc:
                 self.stop()
                 self.set_status(f"Playback failed: {exc}")
                 return
-            state["anchor_ms"] = float(loop[0])
+            state["anchor_ms"] = target
             state["origin"] = time.perf_counter()
-            position = float(loop[0])
+            position = target
         elif position >= song_end:
             self.stop()
             self.set_status("Stopped.")
             return
         self.show_at(position, "Looping" if loop else "Playing", state["label"])
-        self.after_id = self.root.after(40, self.tick_playhead)
+        wait = 40 if not loop else max(5, min(40, int(loop[1] - position)))
+        self.after_id = self.root.after(wait, self.tick_playhead)
 
     def tick_pedal(self, state: dict) -> None:
         """Follow the pedal path. Ranges change on a bar line, like the RC-10R."""
@@ -2804,7 +2949,7 @@ class Finder:
         return f"{self.view['artist']} — {self.view['title']}"
 
     def pedal_closed(self) -> None:
-        if self.playing and self.playing.get("pedal"):
+        if self.pending_pedal or (self.playing and self.playing.get("pedal")):
             self.stop()
             self.set_status("Stopped.")
         self.pedal.stop_all()
@@ -2841,7 +2986,11 @@ class Finder:
         if self.pending_pedal:
             return
         if self.playing and self.playing.get("pedal") and not self.playing.get("paused"):
-            self.pedal_clock(self.playhead_ms())
+            at = self.playhead_ms()
+            pressed = self.pedal_window.press_at if self.pedal_window else None
+            if pressed is not None:
+                at -= max(0.0, time.perf_counter() - pressed) * 1000
+            self.pedal_clock(at)
         result = getattr(self.pedal, name)()
         if result == "start":
             self.pedal_start()
@@ -3012,6 +3161,8 @@ class Finder:
     def on_stop(self) -> None:
         if self.playing and self.playing.get("follow") and self.chrome_live():
             self.bridge.send("pause")
+            # Chrome still reports playing until the pause reaches the page.
+            self.follow_retry_at = time.time() + 1.0
         self.stop()
         self.set_status("Stopped.")
 
@@ -3035,6 +3186,11 @@ class Finder:
         if state.get("songId") != self.tab.song_id:
             title = str(state.get("title") or "another song").split(" Tab")[0].split(" Drum")[0]
             return None, f"Chrome: showing {title}"
+        try:
+            state["measure"] = None if state.get("measure") is None else int(state["measure"])
+            state["speed"] = int(state.get("speed") or 100)
+        except (TypeError, ValueError):
+            state["measure"] = None
         if state.get("measure") is None:
             now = time.perf_counter()
             if self.chrome_good and now - self.chrome_good_at < 0.5:
@@ -3092,8 +3248,7 @@ class Finder:
         elapsed = time.time() * 1000 - float(state.get("markAt") or 0)
         if not state.get("playing"):
             elapsed = 0.0
-        speed = max(25, min(200, int(state.get("speed") or 100))) / 100.0
-        elapsed = max(0.0, min(elapsed * speed, length * share * 1.5))
+        elapsed = max(0.0, min(elapsed, length * share * 1.5))
         start = min(1.0, max(0.0, float(state.get("markFraction") or 0.0)))
         target = bar_ms[midi_bar - 1] + (inner + start * share) * length + elapsed
         return min(target, bar_ms[-1] - 1), bar, midi_bar
@@ -3110,7 +3265,9 @@ class Finder:
             return
         if state is None:
             # Keep the last live line briefly when Chrome hiccups.
-            if self.chrome_good and time.perf_counter() - self.chrome_good_at < 0.6 and why.startswith("Chrome: stopped"):
+            recent = self.chrome_good and time.perf_counter() - self.chrome_good_at < 0.6
+            same_tab = self.tab is not None and recent and self.chrome_good.get("songId") == self.tab.song_id
+            if same_tab and why.startswith("Chrome: stopped"):
                 state = self.chrome_good
             else:
                 self.show_chrome_text(why, hold=0.35)
@@ -3134,7 +3291,15 @@ class Finder:
             if following and not self.playing.get("paused"):
                 self.pause_playback()
             return
+        if speed != 100:
+            # The preview always plays at full speed, so it cannot follow a slowed tab.
+            self.show_chrome_text(f"Chrome: tab at {speed}% · set Songsterr to 100% to play along", hold=0.25)
+            if following and not self.playing.get("paused"):
+                self.pause_playback()
+            return
         if self.preparing or self.pending_start is not None or time.time() < self.follow_retry_at:
+            return
+        if not following and target >= self.view["bar_ms"][-1] - 50:
             return
         if not following:
             if self.playing:
@@ -3190,7 +3355,15 @@ class Finder:
             self.chrome_slot_frame.configure(width=max(280, self.chrome_slot * 7))
 
     def chrome_setup(self) -> None:
-        folder = ROOT / "chrome-extension"
+        folder = BUNDLE / "chrome-extension"
+        if FROZEN:
+            # Chrome needs a folder that stays put, so keep a copy outside the app.
+            folder = LOCAL_DATA / "chrome-extension"
+            try:
+                shutil.copytree(BUNDLE / "chrome-extension", folder, dirs_exist_ok=True)
+            except OSError as error:
+                messagebox.showerror("Play along with Songsterr", f"Could not prepare the Chrome helper:\n{error}", parent=self.root)
+                return
         steps = (
             "Load the small helper into Chrome once:\n\n"
             "1. In Chrome, open chrome://extensions\n"
@@ -3271,6 +3444,8 @@ class Finder:
         has_sections = ready and bool(tab.sections)
         for widget in (self.shift_down, self.shift_up, self.shift_auto):
             widget.configure(state="normal" if ready else "disabled")
+        for widget in (self.chart_shift_down, self.chart_shift_up):
+            widget.configure(state="normal" if ready else "disabled")
         self.tab_parts_check.configure(state="normal" if has_sections else "disabled")
         self.use_tab_button.configure(state="normal" if has_sections else "disabled")
         self.match_tempo_button.configure(state="normal" if ready and tab.bars else "disabled")
@@ -3278,6 +3453,7 @@ class Finder:
         self.tab_drums_button.configure(state="normal" if has_drums else "disabled")
         if not ready:
             self.shift_label["text"] = ""
+            self.chart_shift_label["text"] = "Songsterr line-up"
             if not keep_info:
                 self.set_tab_info("Songsterr: pick a song.")
             return
@@ -3288,6 +3464,7 @@ class Finder:
         else:
             line = f"MIDI bar 1 = Songsterr bar {1 - shift * (2 if half else 1)}"
         self.shift_label["text"] = line
+        self.chart_shift_label["text"] = line
         midi_ms = view["bar_ms"][-1] - view["bar_ms"][0]
         tab_ms = tab.seconds() * 1000
         bpm = tab.first_bpm()
@@ -3946,6 +4123,7 @@ class Finder:
         self.playing = None
         self.pending_start = None
         self.pending_follow = False
+        self.pending_pedal = False
         self.cancel_tick()
         close_preview()
         self.device_open = False
@@ -3995,11 +4173,10 @@ class Finder:
 
     def add_worker(self, path: Path, artist: str, title: str, divisions: dict, note: str) -> None:
         try:
-            report = add_to_list(path, artist, title, divisions, note)
+            report, song = add_to_list(path, artist, title, divisions, note)
             error = ""
         except Exception as exc:
-            report, error = "", str(exc)
-        song = song_id(title)
+            report, error, song = "", str(exc), ""
         self.from_worker(lambda: self.finish_add(report, error, song))
 
     def finish_add(self, report: str, error: str, song: str) -> None:

@@ -8,11 +8,23 @@ command for the page (play or pause).
 from __future__ import annotations
 
 import json
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = 47391
+
+
+class _ExclusiveServer(ThreadingHTTPServer):
+    """On Windows, address reuse lets a second finder bind the same port without an error."""
+
+    allow_reuse_address = False
+
+    def server_bind(self) -> None:
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
 
 class ChromeBridge:
@@ -27,25 +39,40 @@ class ChromeBridge:
         bridge = self
 
         class Handler(BaseHTTPRequestHandler):
+            timeout = 5
+
+            def _allowed(self) -> bool:
+                # Only the extension (or a program on this computer, which sends no
+                # Origin) may talk to the finder. Web pages and DNS rebinding may not.
+                origin = self.headers.get("Origin")
+                host = (self.headers.get("Host") or "").lower()
+                if host not in (f"127.0.0.1:{bridge.port}", f"localhost:{bridge.port}"):
+                    return False
+                return origin is None or origin.startswith("chrome-extension://")
+
             def _headers(self, code: int = 200) -> None:
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
-                self.send_header("Access-Control-Allow-Headers", "Content-Type")
-                self.send_header("Access-Control-Allow-Private-Network", "true")
+                origin = self.headers.get("Origin")
+                if origin and origin.startswith("chrome-extension://"):
+                    self.send_header("Access-Control-Allow-Origin", origin)
+                    self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+                    self.send_header("Access-Control-Allow-Headers", "Content-Type")
                 self.end_headers()
 
             def do_OPTIONS(self) -> None:  # noqa: N802
-                self._headers(204)
+                self._headers(204 if self._allowed() else 403)
 
             def do_POST(self) -> None:  # noqa: N802
+                if not self._allowed():
+                    self._headers(403)
+                    return
                 if self.path.rstrip("/") != "/songsterr":
                     self._headers(404)
                     return
                 try:
-                    length = int(self.headers.get("Content-Length") or 0)
-                    state = json.loads(self.rfile.read(min(length, 65536)) or b"{}")
+                    length = max(0, min(int(self.headers.get("Content-Length") or 0), 65536))
+                    state = json.loads(self.rfile.read(length) or b"{}")
                 except (ValueError, json.JSONDecodeError):
                     self._headers(400)
                     return
@@ -57,7 +84,7 @@ class ChromeBridge:
                 pass
 
         try:
-            self.server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+            self.server = _ExclusiveServer(("127.0.0.1", port), Handler)
         except OSError as exc:
             self.error = f"Port {port} is busy ({exc.strerror or exc}). Is another finder open?"
             return
