@@ -1,12 +1,16 @@
-"""Write the finder's edited drum part as a type 0 MIDI for Rhythm Converter.
+"""Write the finder's edited drum part as a MIDI for Rhythm Converter.
 
-The source MIDI is never changed. The export carries the drum notes on
+The source MIDI is never changed. The first track carries the drum notes on
 channel 10, the tempo map, and a time signature for every meter change.
+With no other parts that is a type 0 file. Guitar and bass parts kept from
+the song ride along as extra tracks, which makes it type 1.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+
+import keep_tracks
 
 PEDAL_ORDER = ("intro", "pattern1", "pattern1Fill", "pattern2", "pattern2Fill", "ending")
 
@@ -68,6 +72,7 @@ def build(
     boundaries: list[int],
     meters: list[tuple[int, int]],
     name: str = "Drums",
+    extra: list | None = None,
 ) -> bytes:
     messages: list[tuple[int, int, bytes]] = []
     title = name.encode("latin1", errors="replace")[:120]
@@ -99,8 +104,15 @@ def build(
         track += _vlq(tick - cursor) + data
         cursor = tick
     track += _vlq(end - cursor) + b"\xff\x2f\x00"
-    header = b"MThd" + (6).to_bytes(4, "big") + (0).to_bytes(2, "big") + (1).to_bytes(2, "big") + int(ppq).to_bytes(2, "big")
-    return header + b"MTrk" + len(track).to_bytes(4, "big") + bytes(track)
+    others = [keep_tracks.chunk(part, end) for part in extra or []]
+    header = (
+        b"MThd"
+        + (6).to_bytes(4, "big")
+        + (1 if others else 0).to_bytes(2, "big")
+        + (1 + len(others)).to_bytes(2, "big")
+        + int(ppq).to_bytes(2, "big")
+    )
+    return header + b"MTrk" + len(track).to_bytes(4, "big") + bytes(track) + b"".join(others)
 
 
 def pedal_parts(
@@ -109,8 +121,12 @@ def pedal_parts(
     boundaries: list[int],
     meters: list[tuple[int, int]],
     divisions: dict[str, list[int]],
+    ranges: list | None = None,
 ) -> tuple[list, list[tuple[int, int]], list[int], list[tuple[int, int]], dict[str, list[int]]]:
     """Copy only the pedal ranges, back to back, in pedal order.
+
+    Pass a list as `ranges` to get back each copy as (source start, source end,
+    shift) in ticks, so other parts can be copied the same way.
 
     A range that sits inside one already copied, like a fill inside its
     pattern, points at those bars instead of being copied twice.
@@ -141,6 +157,8 @@ def pedal_parts(
         out_tempos.append((cursor, tempo_at(tempos, source_a)))
         out_tempos.extend((tick + delta, microseconds) for tick, microseconds in tempos if source_a < tick < source_b)
         copied.append((start, end, first_bar))
+        if ranges is not None:
+            ranges.append((source_a, source_b, delta))
         placed[key] = [first_bar, first_bar + end - start]
     out_events.sort(key=lambda item: (item[0], item[1]))
     return out_events, clean_tempos(out_tempos), out_bounds, out_meters, placed

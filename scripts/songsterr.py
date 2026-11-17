@@ -12,6 +12,7 @@ import http.client
 import json
 import re
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -223,15 +224,21 @@ MISS_DAYS = 1
 ARTIST_COUNT = 1000
 
 
+def _fold(text: str) -> str:
+    """Lower case with accents removed, so "motley" finds "Mötley Crüe"."""
+    plain = "".join(char for char in unicodedata.normalize("NFKD", text) if not unicodedata.combining(char))
+    return plain.casefold()
+
+
 def artist_matches(names: list[str], query: str, limit: int = 8) -> list[str]:
     """Popularity order. A name that starts with the query comes before one that only contains it."""
-    text = query.strip().casefold()
+    text = _fold(query.strip())
     if not text:
         return []
-    starts = [name for name in names if name.casefold().startswith(text)]
-    contains = [name for name in names if text in name.casefold() and name not in starts]
+    starts = [name for name in names if _fold(name).startswith(text)]
+    contains = [name for name in names if text in _fold(name) and name not in starts]
     found = starts + contains
-    if len(found) == 1 and found[0].casefold() == text:
+    if len(found) == 1 and _fold(found[0]) == text:
         return []
     return found[:limit]
 
@@ -243,27 +250,27 @@ def song_matches(
 
     A label is "Title  ·  Artist" until the artist box narrows it to one artist.
     """
-    text = query.strip().casefold()
-    wanted = artist.strip().casefold()
+    text = _fold(query.strip())
+    wanted = _fold(artist.strip())
     pool = songs
     narrowed = False
     if wanted:
-        exact = [item for item in songs if item[0].casefold() == wanted]
+        exact = [item for item in songs if _fold(item[0]) == wanted]
         if exact:
             pool, narrowed = exact, True
         else:
-            prefixed = [item for item in songs if item[0].casefold().startswith(wanted)]
-            if len({item[0].casefold() for item in prefixed}) == 1:
+            prefixed = [item for item in songs if _fold(item[0]).startswith(wanted)]
+            if len({_fold(item[0]) for item in prefixed}) == 1:
                 pool, narrowed = prefixed, True
     if not text and not narrowed:
         return []
-    starts = [item for item in pool if not text or item[1].casefold().startswith(text)]
-    contains = [item for item in pool if text and text in item[1].casefold() and item not in starts]
+    starts = [item for item in pool if not text or _fold(item[1]).startswith(text)]
+    contains = [item for item in pool if text and text in _fold(item[1]) and item not in starts]
     found = (starts if text or narrowed else []) + contains
     if text:
-        found = [item for item in found if text in item[1].casefold()]
+        found = [item for item in found if text in _fold(item[1])]
     labels = [item[1] if narrowed else f"{item[1]}  ·  {item[0]}" for item in found]
-    if len(labels) == 1 and labels[0].split("  ·  ")[0].casefold() == text:
+    if len(labels) == 1 and _fold(labels[0].split("  ·  ")[0]) == text:
         return []
     return labels[:limit]
 
@@ -527,6 +534,14 @@ class TabDrums:
     dropped: dict[int, int]
 
 
+def _duration(beat: dict) -> Fraction:
+    """A beat's length as a fraction of a whole note; a missing or broken value counts as zero."""
+    try:
+        return Fraction(*(beat.get("duration") or (0, 1)))
+    except (TypeError, ValueError, ZeroDivisionError):
+        return Fraction(0)
+
+
 def drum_part(tab: Tab) -> tuple[dict, dict]:
     """Download the drum part load_track() reads. Returns (meta, track)."""
     meta = _json(f"{API}/meta/{tab.song_id}")
@@ -585,7 +600,7 @@ def drums_to_midi(track: dict, ppq: int) -> TabDrums:
         if played == 0 and track.get("anacrusis"):
             filled = max(
                 (
-                    sum(Fraction(*beat["duration"]) for beat in voice.get("beats") or [] if not beat.get("graceNote"))
+                    sum(_duration(beat) for beat in voice.get("beats") or [] if not beat.get("graceNote"))
                     for voice in measure.get("voices") or []
                 ),
                 default=length,
@@ -598,7 +613,7 @@ def drums_to_midi(track: dict, ppq: int) -> TabDrums:
             position = Fraction(0)
             dynamic = DYNAMICS["f"]
             for beat in voice.get("beats") or []:
-                duration = Fraction(*beat.get("duration") or (0, 1))
+                duration = _duration(beat)
                 if beat.get("velocity") in DYNAMICS:
                     dynamic = DYNAMICS[beat["velocity"]]
                 grace = beat.get("graceNote")
@@ -639,6 +654,118 @@ def drums_to_midi(track: dict, ppq: int) -> TabDrums:
         sections=sections_from(bars),
         moved=moved,
         dropped=dropped,
+    )
+
+
+@dataclass
+class TabNotes:
+    """A guitar or bass part as notes on its played bars.
+
+    Each note is (bar, start, length, string, fret, flags). bar counts played bars from 0.
+    start and length are shares of that bar. string 0 is the highest string, so
+    tuning[string] is its open pitch. flags: d dead, g ghost, t tied to the note before,
+    s slide, h hammer-on or pull-off, b bend, p palm mute, a accent.
+    """
+
+    name: str
+    kind: str
+    strings: int
+    tuning: list[int]
+    bars: int
+    notes: list[tuple[int, float, float, int, int, str]]
+    program: int = -1
+
+
+def fetch_part(tab: Tab, index: int) -> dict:
+    """Download one part's notes. Songsterr serves every part the way it serves the drums."""
+    meta = _json(f"{API}/meta/{tab.song_id}")
+    base = f"{TRACK_HOST}/{tab.song_id}/{meta['revisionId']}/{meta['image']}"
+    return _json(f"{base}/{index}.json")
+
+
+def part_to_notes(track: dict) -> TabNotes:
+    """Read a Songsterr guitar or bass part. Repeats are played out like read_measures()."""
+    measures = track.get("measures") or []
+    if not measures:
+        raise ValueError("Songsterr's part has no bars.")
+    try:
+        strings = max(1, min(12, int(track.get("strings") or 6)))
+    except (TypeError, ValueError):
+        strings = 6
+    tuning: list[int] = []
+    for pitch in track.get("tuning") or []:
+        try:
+            tuning.append(int(pitch))
+        except (TypeError, ValueError):
+            tuning.append(0)
+    tuning = (tuning + [0] * strings)[:strings]
+    meters = measure_meters(measures)
+    order = play_order(measures)
+    notes: list[tuple[int, float, float, int, int, str]] = []
+    try:
+        program = int(track.get("instrumentId"))
+    except (TypeError, ValueError):
+        program = -1
+    for played, source in enumerate(order):
+        measure = measures[source]
+        meter = meters[source]
+        length = Fraction(meter[0], meter[1])
+        if played == 0 and track.get("anacrusis"):
+            filled = max(
+                (
+                    sum(_duration(beat) for beat in voice.get("beats") or [] if not beat.get("graceNote"))
+                    for voice in measure.get("voices") or []
+                ),
+                default=length,
+            )
+            if 0 < filled < length:
+                length = filled
+        if measure.get("rest"):
+            continue
+        for voice in measure.get("voices") or []:
+            position = Fraction(0)
+            for beat in voice.get("beats") or []:
+                duration = _duration(beat)
+                grace = beat.get("graceNote")
+                at = position - min(duration, Fraction(1, 32)) if grace == "beforeBeat" else position
+                if not grace:
+                    position += duration
+                if beat.get("rest") or at >= length:
+                    continue
+                for note in beat.get("notes") or []:
+                    if note.get("rest") or "fret" not in note or "string" not in note:
+                        continue
+                    try:
+                        string, fret = int(note["string"]), int(note["fret"])
+                    except (TypeError, ValueError):
+                        continue
+                    if not 0 <= string < strings or not 0 <= fret <= 99:
+                        continue
+                    flags = ""
+                    for key, letter in (("dead", "d"), ("ghost", "g"), ("tie", "t"), ("slide", "s"), ("hp", "h"), ("bend", "b")):
+                        if note.get(key):
+                            flags += letter
+                    if beat.get("palmMute") or note.get("palmMute"):
+                        flags += "p"
+                    if note.get("accentuated"):
+                        flags += "a"
+                    notes.append((
+                        played,
+                        float(max(Fraction(0), at) / length),
+                        float(duration / length) if not grace else 0.0,
+                        string,
+                        fret,
+                        flags,
+                    ))
+    notes.sort(key=lambda item: (item[0], item[1], item[3]))
+    return TabNotes(
+        name=part_name(str(track.get("name") or "Part")),
+        kind=part_kind(track),
+        strings=strings,
+        tuning=tuning,
+        bars=len(order),
+        notes=notes,
+        program=program,
     )
 
 

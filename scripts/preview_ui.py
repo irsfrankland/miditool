@@ -16,6 +16,7 @@ from tkinter import font as tkfont
 from tkinter import ttk
 
 import build_section_chart as chart
+import string_synth
 
 ROLE = {
     "intro": "#2f9e62",
@@ -882,18 +883,33 @@ def _sound(note: int) -> list[float]:
     return sound
 
 
-def render_section(events: list[list[int]], start_ms: int, end_ms: int) -> bytes:
-    duration = max(0.05, (end_ms - start_ms) / 1000)
+def render_section(
+    events: list[list[int]],
+    start_ms: int,
+    end_ms: int,
+    speed: float = 1.0,
+    strings: list | None = None,
+    strings_gain: float = 0.4,
+) -> bytes:
+    """Drum audio for song time start_ms..end_ms. At speed 0.5 the hits sit twice as far apart.
+
+    The drum sounds themselves are not stretched, so slowing down keeps their pitch.
+    `strings` are guitar and bass notes (see string_synth) mixed in under the drums.
+    """
+    speed = max(0.05, float(speed))
+    duration = max(0.05, (end_ms - start_ms) / 1000 / speed)
     total = int(duration * RATE) + int(0.05 * RATE)
     mix = [0.0] * total
     for ms, note, velocity in events:
         if ms < start_ms or ms >= end_ms:
             continue
-        pos = int((ms - start_ms) / 1000 * RATE)
+        pos = int((ms - start_ms) / 1000 / speed * RATE)
         sound = _sound(note)
         level = max(0.15, velocity / 127)
         end = min(total, pos + len(sound))
         mix[pos:end] = [old + new * level for old, new in zip(mix[pos:end], sound)]
+    if strings:
+        string_synth.mix_notes(mix, strings, start_ms, end_ms, speed, RATE, strings_gain)
     peak = max(max(mix, default=0.0), -min(mix, default=0.0)) or 1.0
     scale = 28000 / peak
     samples = array.array("h", [int(sample * scale) for sample in mix])

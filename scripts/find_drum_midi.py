@@ -38,11 +38,15 @@ from tkinter import font as tkfont
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import album_art
+import drum_roll
 import build_section_chart as chart
+import keep_tracks
 import midi_export
 from chrome_bridge import ChromeBridge
 import songsterr
+import string_synth
 import suggest_sections
+import tab_roll
 from pedal_sim import PedalMachine, PedalWindow
 from preview_ui import ROLE, SectionChart, bar_lanes, render_section
 
@@ -260,13 +264,33 @@ def search_songsterr(query: str) -> list[Hit]:
     return found
 
 
+def tab_kept(tab: songsterr.Tab, drums: songsterr.TabDrums, ppq: int) -> list[keep_tracks.Kept]:
+    """The tab's most viewed guitar, bass and vocal, on the drums' bars. A part that cannot be read is left out."""
+    kept = []
+    for channel, kind in ((0, "guitar"), (1, "bass"), (2, "vocal")):
+        part = tab.best_part(SONGSTERR_KIND.get(kind, kind))
+        if part is None:
+            continue
+        try:
+            notes = songsterr.part_to_notes(songsterr.fetch_part(tab, part.index))
+            track = keep_tracks.from_tab(notes, drums.bounds, ppq, channel, notes.program, kind)
+        except (OSError, ValueError, KeyError, TypeError, IndexError):
+            continue
+        if track is not None:
+            kept.append(track)
+    return kept
+
+
 def songsterr_midi(tab: songsterr.Tab, ppq: int = 480) -> Path:
-    """Write the tab's drum part as a type 0 MIDI in incoming."""
+    """Write the tab's drums, with its guitar, bass and vocal as extra tracks, as a MIDI in incoming."""
     _meta, track = songsterr.drum_part(tab)
     drums = songsterr.drums_to_midi(track, ppq)
     if not drums.ticks:
         raise ValueError("Songsterr's drum part for this song has no notes.")
-    data = midi_export.build(ppq, drums.ticks, drums.tempos, drums.bounds, drums.meters, f"{tab.artist} - {tab.title}")
+    data = midi_export.build(
+        ppq, drums.ticks, drums.tempos, drums.bounds, drums.meters, f"{tab.artist} - {tab.title}",
+        extra=tab_kept(tab, drums, ppq),
+    )
     INCOMING.mkdir(parents=True, exist_ok=True)
     name = safe_name(f"{tab.artist} - {tab.title} [Songsterr {tab.song_id}].mid", "songsterr.mid")
     path = unique_path(INCOMING / name)
@@ -313,8 +337,13 @@ def song_id(title: str) -> str:
     return slug or "song"
 
 
+WINDOWS_DEVICE_NAMES = {"CON", "PRN", "AUX", "NUL", *(f"COM{n}" for n in range(1, 10)), *(f"LPT{n}" for n in range(1, 10))}
+
+
 def safe_name(name: str, fallback: str) -> str:
-    cleaned = re.sub(r'[<>:"/\\|?*]', "_", name).strip().rstrip(".")
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip().rstrip(". ")
+    if cleaned.split(".")[0].strip().upper() in WINDOWS_DEVICE_NAMES:
+        cleaned = "_" + cleaned  # CON.mid, NUL.mid and the like are devices, not files, on Windows
     return cleaned or fallback
 
 
@@ -368,10 +397,18 @@ SONGSTERR_CACHE = LOCAL_DATA / "songsterr"
 PREVIEWS = LOCAL_DATA / "previews"
 ERROR_LOG = LOCAL_DATA / "errors.log"
 KEEP_PREVIEWS = 4
+# The bar chart grows with the window up to this height, and shrinks again once the window is too short for it.
+CHART_MAX = 520
+CHART_MIN = 300
+# Playback speed as a share of the song's own tempo. Slower than this makes the preview file very long.
+MIN_SPEED = 0.25
+MAX_SPEED = 2.0
 KEEP_SESSIONS = 20
 MIDI_SUFFIXES = {".mid", ".midi", ".kar"}
 COVER_SIZE = 88
 PART_NOUNS = {"drums": "drum", "guitar": "guitar", "bass": "bass"}
+# Songsterr calls a vocal part "vocals".
+SONGSTERR_KIND = {"vocal": "vocals"}
 SCAN_MS = 4000
 HISTORY_LIMIT = 200
 # Undo steps that do not change the saved MIDI, so they leave nothing unsaved.
@@ -913,6 +950,30 @@ def apply_theme(root: tk.Tk) -> None:
         foreground=[("disabled", TEXT)],
     )
     style.configure(
+        "TCombobox",
+        fieldbackground=FIELD,
+        background=PANEL,
+        foreground=TEXT,
+        arrowcolor=TEXT,
+        bordercolor=LINE,
+        lightcolor=LINE,
+        darkcolor=LINE,
+        padding=(6, 3),
+    )
+    style.map(
+        "TCombobox",
+        fieldbackground=[("readonly", FIELD), ("disabled", PANEL)],
+        foreground=[("readonly", TEXT), ("disabled", TEXT)],
+        selectbackground=[("readonly", FIELD)],
+        selectforeground=[("readonly", TEXT)],
+        arrowcolor=[("disabled", DISABLED_TEXT)],
+        bordercolor=[("focus", ACCENT)],
+    )
+    style.master.option_add("*TCombobox*Listbox.background", FIELD)
+    style.master.option_add("*TCombobox*Listbox.foreground", TEXT)
+    style.master.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+    style.master.option_add("*TCombobox*Listbox.selectForeground", ACCENT_INK)
+    style.configure(
         "TButton",
         background=PANEL,
         foreground=TEXT,
@@ -956,6 +1017,57 @@ def apply_theme(root: tk.Tk) -> None:
         ("Menubutton.padding", {"sticky": "nswe", "children": [("Menubutton.label", {"sticky": "nswe"})]})
     ]})])
     style.map("Menu.TMenubutton", background=[("active", HOVER), ("pressed", HOVER)])
+    # Chips are the toggles on the rolls: flat like the buttons above, lit when on. The part toggles
+    # take the colour their lane is drawn in.
+    chip_layout = [("Toolbutton.border", {"sticky": "nswe", "children": [
+        ("Toolbutton.padding", {"sticky": "nswe", "children": [("Toolbutton.label", {"sticky": "nswe"})]})
+    ]})]
+    chip_colors = {"Chip": ACCENT, **{f"{title}.Chip": color for title, color in (
+        ("Guitar", tab_roll.KIND_COLORS["guitar"]), ("Bass", tab_roll.KIND_COLORS["bass"]), ("Vocal", tab_roll.KIND_COLORS["vocal"]),
+    )}}
+    for base in ("TCheckbutton", "TRadiobutton"):
+        for prefix, color in chip_colors.items():
+            name = f"{prefix}.{base}"
+            lit = drum_roll.mix(PANEL, color, 0.2)
+            lit_hover = drum_roll.mix(PANEL, color, 0.32)
+            style.layout(name, chip_layout)
+            style.configure(
+                name, background=PANEL, foreground=MUTED, padding=(12, 4), borderwidth=0, relief="flat",
+                focusthickness=0, focuscolor=PANEL, anchor="center", font=UI_FONT,
+                bordercolor=PANEL, lightcolor=PANEL, darkcolor=PANEL,
+            )
+            style.map(
+                name,
+                background=[("disabled", PANEL), ("selected", "active", lit_hover), ("selected", lit), ("active", HOVER)],
+                foreground=[("disabled", DISABLED_TEXT), ("selected", color)],
+                relief=[("disabled", "flat"), ("!disabled", "flat")],
+                bordercolor=[("selected", lit), ("active", HOVER), ("!active", PANEL)],
+                lightcolor=[("selected", lit), ("active", HOVER), ("!active", PANEL)],
+                darkcolor=[("selected", lit), ("active", HOVER), ("!active", PANEL)],
+            )
+    style.configure(
+        "Flat.TCombobox",
+        fieldbackground=PANEL,
+        background=PANEL,
+        foreground=TEXT,
+        arrowcolor=MUTED,
+        bordercolor=PANEL,
+        lightcolor=PANEL,
+        darkcolor=PANEL,
+        padding=(8, 4),
+    )
+    style.map(
+        "Flat.TCombobox",
+        fieldbackground=[("readonly", "active", HOVER), ("readonly", PANEL), ("disabled", PANEL)],
+        background=[("active", HOVER), ("disabled", PANEL)],
+        foreground=[("readonly", TEXT), ("disabled", MUTED)],
+        selectbackground=[("readonly", PANEL), ("readonly", "active", HOVER)],
+        selectforeground=[("readonly", TEXT)],
+        arrowcolor=[("disabled", PANEL), ("active", TEXT)],
+        bordercolor=[("focus", ACCENT), ("active", HOVER)],
+        lightcolor=[("active", HOVER)],
+        darkcolor=[("active", HOVER)],
+    )
     style.configure("Small.TButton", padding=(10, 4), width=-3)
     style.configure("SmallAccent.TButton", background=ACCENT, foreground=ACCENT_INK, padding=(10, 4), width=-3)
     style.map(
@@ -1337,6 +1449,7 @@ class ScrollArea(ttk.Frame):
         self.rowconfigure(0, weight=1)
         self.showing = False
         self._size = (0, 0)
+        self.before_fit = None
         self.canvas.bind("<Configure>", lambda _event: self.fit())
         self._poll()
 
@@ -1348,6 +1461,9 @@ class ScrollArea(ttk.Frame):
         width, height = self.canvas.winfo_width(), self.canvas.winfo_height()
         if width < 2:
             return
+        if self.before_fit is not None:
+            self.before_fit(height)
+            self.inner.update_idletasks()
         need = self.inner.winfo_reqheight()
         tall = need > height + 1
         if tall != self.showing:
@@ -1403,6 +1519,17 @@ class Finder:
         self.play_token = 0
         self.selection: tuple[int, int] | None = None
         self.loop_on = tk.BooleanVar(value=False)
+        self.bpm_text = tk.StringVar(self.root, value="")
+        self.show_roll = tk.BooleanVar(self.root, value=True)
+        self.roll_source = tk.StringVar(self.root, value="midi")
+        self.roll_refs: tuple | None = None
+        self.roll_tab_key: tuple | None = None
+        self.roll_tabs: dict[int, dict] = {}
+        self.tab_roll_refs: tuple | None = None
+        self.tab_roll_keys: dict[str, tuple | None] = {}  # what each lane shows, so it is only drawn again when that changes
+        self.tab_roll_choices: dict[str, tuple | None] = {}  # what each lane's part picker offers
+        self.tab_parts: dict[tuple[int, int], dict] = {}
+        self.pending_hold = False
         self.songsterr_token = 0
         self.songsterr_search = ""
         self.link_tab: songsterr.Tab | None = None
@@ -1431,6 +1558,9 @@ class Finder:
         self.loop_bars = tk.StringVar()
         self._selecting = False
         self.rendered_generation: int | None = None
+        self.rendered_hear: tuple | None = None  # what was mixed into the rendered audio besides the drums
+        self.render_hear: tuple | None = None
+        self.hear_with = ""
         self.sessions: dict[str, dict] = {}
         clear_previews()
         self.device_open = False
@@ -1484,15 +1614,6 @@ class Finder:
         self.play_all = tool("▶  Play", lambda: self.play("all"), accent=True, space=16, tip="Play the song from the selected bar. Space plays and pauses.")
         self.pause_button = tool("Pause", self.on_pause_button)
         tool("Stop", self.on_stop)
-        loop = ttk.Frame(bar)
-        ttk.Checkbutton(loop, text="Loop", variable=self.loop_on, command=self.on_loop_toggle, takefocus=False).pack(side="left")
-        self.loop_start_entry = ttk.Entry(loop, textvariable=self.loop_start, width=4)
-        self.loop_start_entry.pack(side="left", padx=(6, 0))
-        ttk.Label(loop, text="×", style="Muted.TLabel").pack(side="left", padx=4)
-        self.loop_bars_entry = ttk.Entry(loop, textvariable=self.loop_bars, width=3)
-        self.loop_bars_entry.pack(side="left")
-        bar.add(loop, 12)
-        Tooltip(loop, "Loop from a bar, for a number of bars. Drag on the bars to pick them. Left and Right move the loop; Shift resizes it.")
         bars_button = self.bars_button = ttk.Menubutton(bar, text="Selected bars  ▾", menu=self.bars_menu, style="Menu.TMenubutton")
         bar.add(bars_button, 12)
         Tooltip(bars_button, "Make the selected bars a pedal part, or delete or blank them. A fill uses the last selected bar.")
@@ -1598,7 +1719,6 @@ class Finder:
         body.add(left, minsize=200, width=260, stretch="never")
         body.add(self.right_area, minsize=520, stretch="always")
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(3, weight=1)
         self.heading = ttk.Label(right, text="Pick a song", style="Song.TLabel")
         self.heading.grid(row=0, column=0, sticky="w")
         self.meta = ttk.Label(right, text="", style="Muted.TLabel")
@@ -1622,30 +1742,84 @@ class Finder:
         )
         # Line-up arrows just above the chart, so the tab can be nudged one
         # bar at a time without opening the Songsterr menu.
-        shift_row = ttk.Frame(info)
-        shift_row.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        # It wraps onto a second line when the chart area is narrow.
+        shift_row = Flow(info, gap=0)
+        shift_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         self.chart_shift_down = ttk.Button(shift_row, text="◀", width=3, command=lambda: self.on_shift(-1), state="disabled")
-        self.chart_shift_down.pack(side="left")
+        shift_row.add(self.chart_shift_down)
+        # Play and pause sit between the arrows. It says Play or Pause in words, because a ▶ here
+        # would look the same as the right arrow.
+        self.chart_play = ttk.Button(shift_row, text="Play", width=7, command=self.toggle_play, state="disabled")
+        shift_row.add(self.chart_play, 4)
         self.chart_shift_up = ttk.Button(shift_row, text="▶", width=3, command=lambda: self.on_shift(1), state="disabled")
-        self.chart_shift_up.pack(side="left", padx=(4, 0))
+        shift_row.add(self.chart_shift_up, 4)
+        # The loop controls sit with the line-up arrows, so the chart's controls are in one place.
+        # The line-up text goes last because its length changes.
+        loop = ttk.Frame(shift_row)
+        shift_row.add(loop, 14)
+        ttk.Checkbutton(loop, text="Loop", variable=self.loop_on, command=self.on_loop_toggle, takefocus=False).pack(side="left")
+        self.loop_start_entry = ttk.Entry(loop, textvariable=self.loop_start, width=4)
+        self.loop_start_entry.pack(side="left", padx=(6, 0))
+        ttk.Label(loop, text="×", style="Muted.TLabel").pack(side="left", padx=4)
+        self.loop_bars_entry = ttk.Entry(loop, textvariable=self.loop_bars, width=3)
+        self.loop_bars_entry.pack(side="left")
+        Tooltip(loop, "Loop from a bar, for a number of bars. Drag on the bars to pick them. Left and Right move the loop; Shift resizes it.")
+        # Playback speed is set as a tempo: type a BPM, or step it with − and +.
+        speed = ttk.Frame(shift_row)
+        shift_row.add(speed, 14)
+        ttk.Label(speed, text="BPM", style="Muted.TLabel").pack(side="left")
+        self.bpm_down = ttk.Button(speed, text="−", width=2, command=lambda: self.nudge_bpm(-1), state="disabled")
+        self.bpm_down.pack(side="left", padx=(6, 0))
+        self.bpm_entry = ttk.Entry(speed, textvariable=self.bpm_text, width=5, justify="center", state="disabled")
+        self.bpm_entry.pack(side="left", padx=2)
+        self.bpm_up = ttk.Button(speed, text="+", width=2, command=lambda: self.nudge_bpm(1), state="disabled")
+        self.bpm_up.pack(side="left")
+        self.bpm_reset = ttk.Button(speed, text="Reset", width=5, command=self.reset_bpm, state="disabled")
+        self.bpm_reset.pack(side="left", padx=(6, 0))
+        self.bpm_note = ttk.Label(speed, text="", style="Muted.TLabel")
+        self.bpm_note.pack(side="left", padx=(6, 0))
+        Tooltip(
+            speed,
+            f"Playback tempo. Type a BPM and press Enter, or use − and +. The drums keep their pitch. "
+            f"The range is {round(MIN_SPEED * 100)}%–{round(MAX_SPEED * 100)}% of the song's tempo. "
+            "Following Songsterr in Chrome needs the original tempo.",
+        )
+        self.bpm_entry.bind("<Return>", self.on_bpm_entered)
+        self.bpm_entry.bind("<FocusOut>", self.on_bpm_entered)
         self.chart_shift_label = ttk.Label(shift_row, text="Songsterr line-up", style="Muted.TLabel")
-        self.chart_shift_label.pack(side="left", padx=(8, 0))
+        shift_row.add(self.chart_shift_label, 14)
+        Tooltip(self.chart_play, "Play or pause the drums. Space does the same.")
         Tooltip(self.chart_shift_down, "Move the Songsterr tab one bar earlier")
         Tooltip(self.chart_shift_up, "Move the Songsterr tab one bar later")
         for entry in (self.loop_start_entry, self.loop_bars_entry):
             entry.bind("<FocusOut>", self.on_loop_fields)
             entry.bind("<Return>", self.on_loop_fields)
-        self.chart = SectionChart(right)
+        # The chart is tall enough to read, but not taller than CHART_MAX. Spare room below it stays empty.
+        self.chart_holder = ttk.Frame(right, height=CHART_MAX)
+        self.chart_holder.grid(row=3, column=0, sticky="ew", pady=(0, 6))
+        self.chart_holder.grid_propagate(False)
+        self.chart = SectionChart(self.chart_holder)
         self.chart.on_zoom_changed = self.refresh_zoom
         self.chart.on_bar_click = self.on_bar_click
         self.chart.on_bars_chosen = self.on_bars_chosen
         self.chart.on_bars_inserted = self.on_bars_inserted
         self.chart.on_deselect = self.clear_selection
         self.chart.on_bar_double = self.on_bar_double
-        self.chart.grid(row=3, column=0, sticky="nsew", pady=(0, 6))
+        self.chart.place(x=0, y=0, relwidth=1, relheight=1)
+        self.right_area.before_fit = self.fit_chart
 
+        self.roll = drum_roll.DrumRoll(right, self.show_roll, self.roll_source, on_change=self.on_roll_switch)
+        self.roll.grid(row=4, column=0, sticky="ew", pady=(0, 8))
+        self.roll.clock = self.roll_clock
+        self.tab_roll = tab_roll.TabRolls(
+            right, on_change=self.on_tab_roll_switch, on_wheel=self.roll.zoom, on_hear=self.on_hear_changed
+        )
+        self.tab_roll.grid(row=5, column=0, sticky="ew", pady=(0, 4))
+        # The drum roll's frame moves the part lanes too, so they never drift apart.
+        self.roll.followers.append(self.tab_roll.show)
+        self.roll.on_zoom = self.tab_roll.set_window
         lower = ttk.Frame(right)
-        lower.grid(row=4, column=0, sticky="ew")
+        lower.grid(row=6, column=0, sticky="ew")
         lower.columnconfigure(1, weight=1)
         header = ttk.Frame(lower)
         header.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
@@ -1934,6 +2108,7 @@ class Finder:
             "title": title,
             "ppq": midi["ppq"],
             "ticks": [[tick, note, velocity] for tick, note, velocity in midi["events"]],
+            "kept": list(midi.get("kept") or []),
             "bounds": list(boundaries),
             "tempos": midi_export.clean_tempos(midi["tempos"]),
             "meters": bar_meters(meters, len(hits)),
@@ -1952,6 +2127,7 @@ class Finder:
             "tempo": tempo,
             "meter": meter,
             "generation": 1,
+            "speed": 1.0,
             "key": key,
             "stamp": file_stamp(path),
         }
@@ -1990,7 +2166,7 @@ class Finder:
         self.set_status("Back where you left this song." if resumed and self.undo_stack else "")
         self.load_cover(view["artist"], view["title"])
 
-    SESSION_FIELDS = ("view", "undo_stack", "redo_stack", "dirty", "tab", "link_tab", "songsterr_search", "selection", "rendered_generation")
+    SESSION_FIELDS = ("view", "undo_stack", "redo_stack", "dirty", "tab", "link_tab", "songsterr_search", "selection", "rendered_generation", "rendered_hear")
 
     def park_view(self) -> None:
         """Keep the open song's state so selecting it again needs no parsing, lookup, or render."""
@@ -2086,7 +2262,7 @@ class Finder:
         self._loading = False
 
     SNAPSHOT_KEYS = (
-        "ticks", "bounds", "tempos", "meters", "divisions", "parts", "tab_parts",
+        "ticks", "kept", "bounds", "tempos", "meters", "divisions", "parts", "tab_parts",
         "tab_shift", "tab_half", "tab_sure", "tab_score", "bars_changed",
     )
 
@@ -2386,6 +2562,14 @@ class Finder:
         )
         self.set_status("Suggestion ready. Add to song list keeps it, or change a number if a section landed in the wrong place.")
 
+    def fit_chart(self, room: int) -> None:
+        """Give the bar chart the room the window has, between CHART_MIN and CHART_MAX."""
+        current = int(self.chart_holder.cget("height"))
+        others = self.right_area.inner.winfo_reqheight() - current - 6
+        target = max(CHART_MIN, min(CHART_MAX, room - others - 6))
+        if target != current:
+            self.chart_holder.configure(height=target)
+
     def play(self, key: str) -> None:
         if not self.view:
             self.set_status("Pick a saved song or download a file first.")
@@ -2616,6 +2800,7 @@ class Finder:
         )
         view["bounds"] = bounds
         view["ticks"] = ticks
+        view["kept"] = keep_tracks.cut(view["kept"], cut_a, cut_b)
         view["divisions"] = divisions
         view["parts"] = parts
         view["tab_parts"] = shift_parts_for_cut(view["tab_parts"], start, end, len(hits))
@@ -2654,6 +2839,7 @@ class Finder:
         view = self.view
         _hits, ticks = silence_bars(view["hits"], view["bounds"], view["ticks"], start, end)
         view["ticks"] = ticks
+        view["kept"] = keep_tracks.blank(view["kept"], view["bounds"][start - 1], view["bounds"][end])
         view["bars_changed"] = True
         self.edited(f"Blanked {span}. They stay in place, so the song is the same length. Undo brings the hits back.")
 
@@ -2681,6 +2867,7 @@ class Finder:
         )
         view["bounds"] = new_bounds
         view["ticks"] = ticks
+        view["kept"] = keep_tracks.insert(view["kept"], anchor, max(int(duration), 1) * count)
         view["divisions"] = divisions
         view["parts"] = parts
         view["tab_parts"] = shift_parts_for_insert(view["tab_parts"], place_at, count, len(hits))
@@ -2708,19 +2895,27 @@ class Finder:
             return
         generation = view["generation"]
         path = preview_path(view["key"], generation)
-        if self.rendered_generation == generation and path.is_file():
+        hear = self.hear_key()
+        if self.rendered_generation == generation and path.is_file() and self.rendered_hear == hear:
+            if hear is None:
+                self.hear_with = ""
             self.finish_start()
             return
         if self.preparing:
             return
+        if self.device_open:
+            close_preview()
+            self.device_open = False
         self.preparing = True
         self.play_token += 1
         token = self.play_token
-        self.set_status("Preparing the drum track…")
+        self.render_hear = hear
+        plans, missing = self.hear_plan()
+        self.set_status("Preparing the drum track and the other parts…" if plans else "Preparing the drum track…")
         events = view["events"]
         threading.Thread(
             target=self.render_worker,
-            args=(token, generation, events, view["bar_ms"][0], view["bar_ms"][-1]),
+            args=(token, generation, events, view["bar_ms"][0], view["bar_ms"][-1], self.speed(), plans, missing, self.hear_gain()),
             daemon=True,
         ).start()
 
@@ -2737,15 +2932,36 @@ class Finder:
         events: list,
         start_ms: int,
         end_ms: int,
+        speed: float = 1.0,
+        plans: list | None = None,
+        missing: list | None = None,
+        gain: float = 0.0,
     ) -> None:
+        strings: list = []
+        heard: list[str] = []
+        problems = list(missing or [])
+        for plan in plans or []:
+            try:
+                notes = self.resolve_hear(plan)
+            except Exception as exc:
+                if not isinstance(exc, (OSError, ValueError, KeyError, TypeError, IndexError)):
+                    log_error(type(exc), exc, exc.__traceback__)
+                problems.append(f"{plan['kind']} could not be read")
+                continue
+            if notes:
+                strings.extend(notes)
+                heard.append(f"{plan['kind']} ({plan['source']})")
+            else:
+                problems.append(f"no {plan['kind']} notes on these bars")
         try:
-            wav = render_section(events, start_ms, end_ms)
+            wav = render_section(events, start_ms, end_ms, speed, strings, gain)
             error = ""
         except Exception as exc:
             wav, error = b"", str(exc)
-        self.from_worker(lambda: self.begin_rendered(token, generation, wav, error))
+        text = (" with " + " and ".join(heard) if heard else "") + (f" ({'; '.join(problems)})" if problems else "")
+        self.from_worker(lambda: self.begin_rendered(token, generation, wav, error, text))
 
-    def begin_rendered(self, token: int, generation: int, wav: bytes, error: str) -> None:
+    def begin_rendered(self, token: int, generation: int, wav: bytes, error: str, text: str = "") -> None:
         if token != self.play_token:
             return
         self.preparing = False
@@ -2765,11 +2981,14 @@ class Finder:
             self.set_status(f"Playback failed: {exc}")
             return
         self.rendered_generation = generation
+        self.rendered_hear = self.render_hear
+        self.hear_with = text
         self.prune_previews()
         self.finish_start()
 
     def start_failed(self) -> None:
         self.pending_start = None
+        self.pending_hold = False
         self.pending_follow = False
         self.pending_pedal = False
         self.follow_retry_at = time.time() + 3
@@ -2785,7 +3004,7 @@ class Finder:
             if not self.device_open:
                 open_preview(preview_path(view["key"], view["generation"]))
                 self.device_open = True
-            play_at(start_ms - file_start)
+            play_at((start_ms - file_start) / self.speed())
         except Exception as exc:
             self.device_open = False
             close_preview()
@@ -2802,6 +3021,8 @@ class Finder:
             "loop": loop,
             "label": label,
             "file_start": file_start,
+            "speed": self.speed(),
+            "with": self.hear_with,
         }
         if self.pending_follow:
             self.pending_follow = False
@@ -2819,8 +3040,26 @@ class Finder:
             self.pedal.reset()
             self.pedal.set_clock(None)
         self.tick_playhead()
+        if self.pending_hold:
+            # A speed change while paused: come back paused at the same place.
+            self.pending_hold = False
+            self.pause_playback()
+            if self.playing:
+                # Hold the exact place, not the few milliseconds the pause took to arrive.
+                self.playing["anchor_ms"] = float(start_ms)
+                self.update_roll(float(start_ms))
         self.refresh_transport()
         self.update_pedal_display()
+
+    def speed(self) -> float:
+        """How fast the song plays, as a share of its own tempo."""
+        if not self.view:
+            return 1.0
+        return min(MAX_SPEED, max(MIN_SPEED, float(self.view.get("speed", 1.0))))
+
+    def audio_ms(self, song_ms: float, state: dict) -> float:
+        """Where song time song_ms sits in the rendered audio, which is stretched by the speed."""
+        return (song_ms - state["file_start"]) / state.get("speed", 1.0)
 
     def playhead_ms(self) -> float:
         state = self.playing
@@ -2828,7 +3067,7 @@ class Finder:
             return 0.0
         if state.get("paused"):
             return float(state["anchor_ms"])
-        return float(state["anchor_ms"]) + (time.perf_counter() - state["origin"]) * 1000
+        return float(state["anchor_ms"]) + (time.perf_counter() - state["origin"]) * 1000 * state.get("speed", 1.0)
 
     def tick_playhead(self) -> None:
         state = self.playing
@@ -2845,7 +3084,7 @@ class Finder:
             late = position - loop[1]
             target = float(loop[0]) + (late if late < loop[1] - loop[0] else 0.0)
             try:
-                play_at(round(target) - state["file_start"])
+                play_at(self.audio_ms(round(target), state))
             except Exception as exc:
                 self.stop()
                 self.set_status(f"Playback failed: {exc}")
@@ -2857,8 +3096,8 @@ class Finder:
             self.stop()
             self.set_status("Stopped.")
             return
-        self.show_at(position, "Looping" if loop else "Playing", state["label"])
-        wait = 40 if not loop else max(5, min(40, int(loop[1] - position)))
+        self.show_at(position, "Looping" if loop else "Playing", state["label"] + state.get("with", ""))
+        wait = 40 if not loop else max(5, min(40, int((loop[1] - position) / state.get("speed", 1.0))))
         self.after_id = self.root.after(wait, self.tick_playhead)
 
     def tick_pedal(self, state: dict) -> None:
@@ -2890,7 +3129,7 @@ class Finder:
             start, end = self.pedal.span(upcoming)
             target = bar_ms[start - 1] + late
             try:
-                play_at(target - state["file_start"])
+                play_at(self.audio_ms(target, state))
             except Exception as exc:
                 self.stop()
                 self.set_status(f"Playback failed: {exc}")
@@ -2989,7 +3228,7 @@ class Finder:
             at = self.playhead_ms()
             pressed = self.pedal_window.press_at if self.pedal_window else None
             if pressed is not None:
-                at -= max(0.0, time.perf_counter() - pressed) * 1000
+                at -= max(0.0, time.perf_counter() - pressed) * 1000 * self.playing.get("speed", 1.0)
             self.pedal_clock(at)
         result = getattr(self.pedal, name)()
         if result == "start":
@@ -3078,7 +3317,7 @@ class Finder:
         length = bar_ms[index + 1] - bar_ms[index]
         if length <= 0:
             return None
-        return round(num * (4 / den) * 60000 / length)
+        return round(num * (4 / den) * 60000 / length * self.speed())
 
     def pedal_ranges(self) -> str:
         if not self.view:
@@ -3097,6 +3336,233 @@ class Finder:
         self.chart.show_playhead(index, fraction)
         self.set_status(f"{word} {label} · bar {index + 1}")
 
+    # Drum roll under the chart
+
+    def roll_clock(self) -> float | None:
+        """Where the drum roll should be this instant: the playhead while playing, nothing when it is not moving."""
+        if self.view and self.playing and not self.playing.get("paused"):
+            return self.playhead_ms()
+        return None
+
+    def update_roll(self, position: float | None = None) -> None:
+        """Keep the drum roll on the open song, at the playhead or, when stopped, at the selected bar."""
+        roll, view = self.roll, self.view
+        if view is None or len(view["bar_ms"]) < 2:
+            if self.roll_refs is not None:
+                self.roll_refs = None
+                self.roll_tab_key = None
+                roll.clear()
+            if self.tab_roll_refs is not None:
+                self.tab_roll_refs = None
+                self.tab_roll_keys.clear()
+                self.tab_roll.clear()
+            return
+        refs = (view["events"], view["bar_ms"], view["meters"])
+        if self.roll_refs is None or any(new is not old for new, old in zip(refs, self.roll_refs)):
+            self.roll_refs = refs
+            self.roll_tab_key = None
+            roll.set_bars(view["bar_ms"], view["meters"])
+            roll.set_events("midi", view["events"])
+        self.update_roll_tab()
+        if position is None:
+            if self.playing:
+                position = self.playhead_ms()
+            elif self.selection:
+                position = view["bar_ms"][self.selection[0] - 1]
+            else:
+                position = view["bar_ms"][0]
+        roll.show(position)
+        self.update_tab_roll(position)
+
+    def update_tab_roll(self, position: float) -> None:
+        """Keep the guitar, bass and vocal lanes on the open song, at the same place as the drum roll."""
+        view, roll = self.view, self.tab_roll
+        refs = (view["bar_ms"], view["meters"])
+        if self.tab_roll_refs is None or any(new is not old for new, old in zip(refs, self.tab_roll_refs)):
+            self.tab_roll_refs = refs
+            self.tab_roll_keys.clear()
+            roll.set_bars(view["bar_ms"], view["meters"])
+        self.update_tab_part()
+        self.update_hear_label()
+        roll.show(position)
+
+    def update_tab_part(self) -> None:
+        """Fill each lane that is showing."""
+        for kind in self.tab_roll.shown_kinds():
+            self.update_lane(kind)
+
+    def update_lane(self, kind: str) -> None:
+        """One lane: the MIDI's own track or a Songsterr part, drawn as a tab or as a melody."""
+        view, tab, lane = self.view, self.tab, self.tab_roll.lanes[kind]
+        part_kind = SONGSTERR_KIND.get(kind, kind)
+        mine = [track for track in view["kept"] if track.kind == kind]
+        parts = sorted((part for part in tab.parts if part.kind == part_kind), key=lambda part: -part.views) if tab else []
+        names = [part.name for part in parts]
+        entries = [(("midi", index), f"MIDI · {track.name}") for index, track in enumerate(mine)]
+        entries += [(part.index, part.name if names.count(part.name) == 1 else f"{part.name} ({part.index})") for part in parts]
+        notes = None
+        track = None
+        message = ""
+        key: tuple
+        if not entries:
+            message = (
+                "The tab appears when Songsterr has matched this song."
+                if tab is None
+                else f"Songsterr has no {kind} part for this song."
+            )
+            key = ("note", message)
+        else:
+            choices = tuple(entries)
+            if choices != self.tab_roll_choices.get(kind):
+                self.tab_roll_choices[kind] = choices
+                lane.set_choices(entries, lane.part_index())
+            chosen = lane.part_index()
+            if chosen not in [entry[0] for entry in entries]:
+                chosen = entries[0][0]
+            if isinstance(chosen, tuple):
+                track = mine[chosen[1]]
+                key = ("midi", id(track), id(view["bar_ms"]))
+            else:
+                entry = self.tab_parts.get((tab.song_id, chosen))
+                if entry is None:
+                    self.fetch_tab_part(tab, chosen)
+                    entry = self.tab_parts[(tab.song_id, chosen)]
+                if entry["state"] == "ready":
+                    notes = entry["notes"]
+                    key = ("part", id(notes), view["tab_shift"], view["tab_half"], id(view["bar_ms"]))
+                elif entry["state"] == "loading":
+                    message = "Reading Songsterr's part…"
+                    key = ("note", message)
+                else:
+                    message = f"Songsterr's part could not be read ({entry['error']})."
+                    key = ("note", message)
+        if key == self.tab_roll_keys.get(kind):
+            return
+        self.tab_roll_keys[kind] = key
+        if track is not None:
+            convert = chart.tick_to_ms(view["tempos"], view["ppq"])
+            lane.set_melody(string_synth.from_kept([track], convert), message="This MIDI track has no notes.", midi_numbers=True)
+            return
+        if notes is None:
+            lane.set_part([], message=message)
+            return
+        mapped = tab_roll.map_notes(notes, view["bar_ms"], view["tab_shift"], view["tab_half"])
+        if not mapped:
+            message = "Songsterr's part has no notes that land on this song's bars."
+        if kind == "vocal":
+            lane.set_melody(
+                string_synth.from_tab(mapped, notes.tuning, "vocal"), message=message,
+                shift=view["tab_shift"], half=view["tab_half"],
+            )
+            return
+        lane.set_part(
+            mapped, notes.strings, notes.tuning, message=message, shift=view["tab_shift"], half=view["tab_half"]
+        )
+
+    def fetch_tab_part(self, tab: songsterr.Tab, index: int) -> None:
+        """Read one guitar or bass part once. The notes stay in memory only."""
+        key = (tab.song_id, index)
+        self.tab_parts[key] = {"state": "loading", "notes": None, "error": ""}
+        while len(self.tab_parts) > 12:
+            del self.tab_parts[next(iter(self.tab_parts))]
+
+        def work() -> None:
+            notes, error = None, ""
+            try:
+                notes = songsterr.part_to_notes(songsterr.fetch_part(tab, index))
+            except Exception as exc:
+                if not isinstance(exc, (OSError, ValueError, KeyError, TypeError, IndexError)):
+                    log_error(type(exc), exc, exc.__traceback__)
+                error = str(exc) or type(exc).__name__
+            self.from_worker(lambda: self.finish_tab_part(key, notes, error))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def finish_tab_part(self, key: tuple[int, int], notes: songsterr.TabNotes | None, error: str) -> None:
+        if key not in self.tab_parts:
+            return
+        self.tab_parts[key] = {"state": "ready" if notes and notes.notes else "error", "notes": notes, "error": error or "no notes"}
+        self.tab_roll_keys.clear()
+        self.update_roll()
+
+    def on_tab_roll_switch(self) -> None:
+        """A lane was shown or hidden, or another part was picked. A failed read gets another try.
+
+        If that lane is being heard, the mix is built again and playback carries on from here,
+        the same way switching Hear on does — so lead/rhythm changes keep playing.
+        """
+        for key in [key for key, entry in self.tab_parts.items() if entry["state"] == "error"]:
+            del self.tab_parts[key]
+        self.tab_roll_keys.clear()
+        self.update_roll()
+        self.on_hear_changed()
+
+    def update_roll_tab(self) -> None:
+        """Songsterr's drums on the roll, lined up the way the chart has them."""
+        view, tab, roll = self.view, self.tab, self.roll
+        if not self.show_roll.get() or self.roll_source.get() != "tab":
+            return
+        if tab is None or (tab.best_part("drums") is None and tab.drum_track is None):
+            note = "Songsterr: no drum part to show." if tab is not None else "Songsterr drums appear when a tab matches."
+            key = ("note", note)
+            events: list | None = []
+            name = ""
+        else:
+            entry = self.roll_tabs.get(tab.song_id)
+            if entry is None:
+                self.fetch_roll_tab(tab)
+                entry = self.roll_tabs[tab.song_id]
+            if entry["state"] == "ready":
+                drums = entry["drums"]
+                key = ("tab", id(drums), view["tab_shift"], view["tab_half"], id(view["bar_ms"]))
+                note, name, events = "", drums.part_name, None
+            else:
+                note = "Reading Songsterr's drums…" if entry["state"] == "loading" else f"Songsterr's drums could not be read ({entry['error']})."
+                key, name, events = ("note", note), "", []
+        if key == self.roll_tab_key:
+            return
+        self.roll_tab_key = key
+        if events is None:
+            drums = self.roll_tabs[tab.song_id]["drums"]
+            events = drum_roll.tab_events(drums.ticks, drums.bounds, view["bar_ms"], view["tab_shift"], view["tab_half"])
+            if not events:
+                note = "Songsterr's drum part has no notes that land on this song's bars."
+        roll.set_events("tab", events, name=name, note=note, shift=view["tab_shift"], half=view["tab_half"])
+
+    def fetch_roll_tab(self, tab: songsterr.Tab) -> None:
+        """Read the tab's drum notes once per song. They stay in memory only."""
+        song_id = tab.song_id
+        self.roll_tabs[song_id] = {"state": "loading", "drums": None, "error": ""}
+        while len(self.roll_tabs) > 8:
+            del self.roll_tabs[next(iter(self.roll_tabs))]
+
+        def work() -> None:
+            drums, error = None, ""
+            try:
+                _meta, track = songsterr.drum_part(tab)
+                drums = songsterr.drums_to_midi(track, 480)
+            except Exception as exc:
+                if not isinstance(exc, (OSError, ValueError, KeyError, TypeError)):
+                    log_error(type(exc), exc, exc.__traceback__)
+                error = str(exc) or type(exc).__name__
+            self.from_worker(lambda: self.finish_roll_tab(song_id, drums, error))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def finish_roll_tab(self, song_id: int, drums: songsterr.TabDrums | None, error: str) -> None:
+        if song_id not in self.roll_tabs:
+            return
+        self.roll_tabs[song_id] = {"state": "ready" if drums else "error", "drums": drums, "error": error or "no notes"}
+        self.roll_tab_key = None
+        self.update_roll()
+
+    def on_roll_switch(self) -> None:
+        """The roll or its Songsterr rows were switched on or off. A failed read gets another try."""
+        for song_id in [key for key, entry in self.roll_tabs.items() if entry["state"] == "error"]:
+            del self.roll_tabs[song_id]
+        self.roll_tab_key = None
+        self.update_roll()
+
     def typing_focus(self) -> bool:
         widget = self.root.focus_get()
         return widget is not None and widget.winfo_class() in {"Entry", "TEntry", "Text"}
@@ -3104,19 +3570,255 @@ class Finder:
     def on_space(self, _event: tk.Event) -> str | None:
         if self.typing_focus():
             return None
+        self.toggle_play()
+        return "break"
+
+    def toggle_play(self) -> None:
+        """Play, pause or resume. Space and the Play button between the line-up arrows both come here."""
         if self.chrome_live() and not self.loop_on.get():
             state, _age = self.bridge.latest()
             self.bridge.send("pause" if state and state.get("playing") else "play")
-            return "break"
+            return
         if self.preparing:
-            return "break"
+            return
         if self.playing and self.playing.get("paused"):
             self.resume_playback()
         elif self.playing:
             self.pause_playback()
         else:
             self.play("all")
-        return "break"
+
+    # Playback speed, set as a tempo
+
+    def base_bpm(self) -> int | None:
+        """The song's own tempo at its first bar."""
+        if not self.view:
+            return None
+        bar_ms = self.view["bar_ms"]
+        num, den = self.bar_meter(0)
+        length = bar_ms[1] - bar_ms[0] if len(bar_ms) > 1 else 0
+        if length <= 0:
+            return None
+        return max(1, round(num * (4 / den) * 60000 / length))
+
+    def refresh_speed(self, keep_text: bool = False) -> None:
+        """Show the playback tempo, and enable the tempo controls when there is a song to play.
+
+        keep_text leaves the box alone while someone is typing in it.
+        """
+        base = self.base_bpm()
+        ready = bool(self.view) and base is not None
+        speed = self.speed()
+        state = "normal" if ready else "disabled"
+        for widget in (self.bpm_down, self.bpm_up, self.bpm_entry):
+            widget.configure(state=state)
+        self.bpm_reset.configure(state="normal" if ready and abs(speed - 1.0) > 0.001 else "disabled")
+        if not ready:
+            self.bpm_text.set("")
+            self.bpm_note["text"] = ""
+            return
+        if not keep_text:
+            self.bpm_text.set(str(round(base * speed)))
+        self.bpm_note["text"] = "" if abs(speed - 1.0) <= 0.001 else f"{round(speed * 100)}%"
+
+    def rebuild_audio(self) -> tuple[tuple | None, bool, bool]:
+        """Work out how to carry on after the audio has to be built again: (resume, was playing, following Chrome).
+
+        resume is (song ms, label, loop, held paused), or None when there is nothing to carry on.
+        """
+        state = self.playing
+        resume = None
+        following = bool(state and state.get("follow")) or self.pending_follow
+        if state and not state.get("pedal") and not following:
+            resume = (self.playhead_ms(), state["label"], state.get("loop"), bool(state.get("paused")))
+        was_playing = bool(state)
+        if state is None and self.preparing:
+            # Still building the audio the old way: build it again the new way.
+            was_playing = True
+            if self.pending_start is not None and not self.pending_pedal and not following:
+                start, label, loop = self.pending_start
+                resume = (start, label, loop, False)
+        return resume, was_playing, following
+
+    # Hearing the guitar and bass
+
+    def hear_kinds(self) -> list[str]:
+        return self.tab_roll.hearing()
+
+    def hear_gain(self) -> float:
+        return 0.7 * max(0, min(100, int(self.tab_roll.hear_volume.get()))) / 100
+
+    def hear_key(self) -> tuple | None:
+        """What is mixed in with the drums, so audio built a different way is built again. None for drums only."""
+        kinds = self.hear_kinds()
+        view = self.view
+        if not kinds or view is None or self.hear_gain() <= 0:
+            return None
+        chosen = tuple(self.chosen_part(kind) for kind in kinds)
+        return (
+            tuple(kinds), round(self.hear_gain(), 3), id(view["kept"]), view["tab_shift"], view["tab_half"],
+            self.tab.song_id if self.tab else None, chosen,
+        )
+
+    def chosen_part(self, kind: str) -> int | tuple | None:
+        """The part picked on a kind's lane, or None when the lane is hidden and nothing was picked."""
+        lane = self.tab_roll.lanes[kind]
+        return lane.part_index() if self.tab_roll.shown[kind].get() else None
+
+    def hear_choice(self, kind: str) -> dict | None:
+        """Where one kind of part comes from: the part picked on its lane, else the MIDI, else Songsterr."""
+        view, tab = self.view, self.tab
+        if view is None:
+            return None
+        part_kind = SONGSTERR_KIND.get(kind, kind)
+        mine = [track for track in view["kept"] if track.kind == kind]
+        parts = [part for part in tab.parts if part.kind == part_kind] if tab else []
+        chosen = self.chosen_part(kind)
+        if isinstance(chosen, tuple):
+            if chosen[1] < len(mine):
+                return {"source": "MIDI", "tracks": [mine[chosen[1]]]}
+        elif chosen is not None:
+            part = next((item for item in parts if item.index == chosen), None)
+            if part is not None:
+                return {"source": "Songsterr", "part": part}
+        if mine:
+            return {"source": "MIDI", "tracks": mine}
+        part = tab.best_part(part_kind) if tab else None
+        if part is not None:
+            return {"source": "Songsterr", "part": part}
+        return None
+
+    def hear_plan(self) -> tuple[list[dict], list[str]]:
+        """What to mix in, by kind: the MIDI's own tracks or a Songsterr part. And what is missing."""
+        view = self.view
+        plans: list[dict] = []
+        missing: list[str] = []
+        if view is None or self.hear_key() is None:
+            return plans, missing
+        for kind in self.hear_kinds():
+            choice = self.hear_choice(kind)
+            if choice is None:
+                missing.append(f"no {kind} in the MIDI or on Songsterr")
+            elif choice["source"] == "MIDI":
+                convert = chart.tick_to_ms(view["tempos"], view["ppq"])
+                plans.append({"kind": kind, "source": "MIDI", "notes": string_synth.from_kept(choice["tracks"], convert)})
+            else:
+                plans.append({
+                    "kind": kind, "source": "Songsterr", "tab": self.tab, "index": choice["part"].index,
+                    "bars": list(view["bar_ms"]), "shift": view["tab_shift"], "half": view["tab_half"],
+                })
+        return plans, missing
+
+    def tab_part_notes(self, tab: songsterr.Tab, index: int) -> songsterr.TabNotes:
+        """A Songsterr part's notes, from memory or read now. Call from a worker thread."""
+        key = (tab.song_id, index)
+        entry = self.tab_parts.get(key)
+        notes = entry["notes"] if entry and entry["state"] == "ready" else None
+        if notes is None:
+            notes = songsterr.part_to_notes(songsterr.fetch_part(tab, index))
+            self.tab_parts[key] = {"state": "ready", "notes": notes, "error": ""}
+        return notes
+
+    def resolve_hear(self, plan: dict) -> list[tuple]:
+        """The notes for one plan, as string_synth notes. Reads the Songsterr part if it is not in memory yet."""
+        if "notes" in plan:
+            return plan["notes"]
+        notes = self.tab_part_notes(plan["tab"], plan["index"])
+        mapped = tab_roll.map_notes(notes, plan["bars"], plan["shift"], plan["half"])
+        return string_synth.from_tab(mapped, notes.tuning, plan["kind"])
+
+    def update_hear_label(self) -> None:
+        """Say, beside each lane that is being heard, where its sound comes from."""
+        hearing = self.hear_kinds()
+        for kind, lane in self.tab_roll.lanes.items():
+            choice = self.hear_choice(kind) if kind in hearing else None
+            text = "" if kind not in hearing else (choice["source"] if choice else "none")
+            if lane.hear_note["text"] != text:
+                lane.hear_note["text"] = text
+
+    def on_hear_changed(self) -> None:
+        """Guitar or bass was switched on or off, or the volume moved. Playing carries on from the same place."""
+        self.update_hear_label()
+        view = self.view
+        if not view:
+            return
+        in_use = self.render_hear if self.preparing else self.rendered_hear
+        if self.hear_key() == in_use:
+            return
+        resume, was_playing, following = self.rebuild_audio()
+        if following:
+            self.set_status("Songsterr in Chrome is the sound while it is followed. The guitar, bass and vocal play when you play here.")
+            return
+        if resume is None:
+            return
+        view["generation"] = view.get("generation", 1) + 1
+        self.stop(drop_audio=True)
+        self.refresh_transport()
+        self.update_pedal_display()
+        position, label, loop, held = resume
+        self.pending_start = (position, label, loop)
+        self.pending_hold = held
+        self.ensure_rendered()
+
+    def set_speed(self, speed: float) -> None:
+        """Change the playback speed. Playing carries on from the same place at the new tempo."""
+        view = self.view
+        if not view:
+            return
+        speed = min(MAX_SPEED, max(MIN_SPEED, speed))
+        if abs(speed - self.speed()) < 0.0005:
+            self.refresh_speed()
+            return
+        resume, was_playing, following = self.rebuild_audio()
+        view["speed"] = speed
+        # The drum audio is rendered at the speed, so the old file is out of date.
+        view["generation"] = view.get("generation", 1) + 1
+        if was_playing:
+            self.stop(drop_audio=True)
+        else:
+            self.rendered_generation = None
+        self.refresh_speed()
+        self.refresh_transport()
+        self.update_pedal_display()
+        base = self.base_bpm()
+        self.set_status(f"Playback tempo {round(base * speed)} BPM ({round(speed * 100)}%)." if base else "Playback speed changed.")
+        if resume is not None:
+            position, label, loop, held = resume
+            self.pending_start = (position, label, loop)
+            self.pending_hold = held
+            self.ensure_rendered()
+        elif was_playing and following:
+            self.set_status("Stopped following Songsterr. It needs the song's own tempo, so press Reset on the BPM to play along.")
+        elif was_playing:
+            self.set_status("Stopped. The pedal rehearsal restarts at the new tempo when you press Start.")
+
+    def on_bpm_entered(self, _event: tk.Event | None = None) -> None:
+        base = self.base_bpm()
+        if not self.view or not base:
+            return
+        text = self.bpm_text.get().strip().lower().removesuffix("bpm").strip()
+        try:
+            bpm = float(text)
+            if not 0 < bpm < 10_000:
+                raise ValueError
+        except ValueError:
+            self.set_status("Type a tempo in beats per minute, like 90.")
+            self.refresh_speed()
+            return
+        low, high = round(base * MIN_SPEED), round(base * MAX_SPEED)
+        if not low <= bpm <= high:
+            self.set_status(f"That song plays between {low} and {high} BPM here. Using {low if bpm < low else high}.")
+        self.set_speed(bpm / base)
+        self.refresh_speed()
+
+    def nudge_bpm(self, step: int) -> None:
+        base = self.base_bpm()
+        if not self.view or not base:
+            return
+        self.set_speed((round(base * self.speed()) + step) / base)
+
+    def reset_bpm(self) -> None:
+        self.set_speed(1.0)
 
     def on_pause_button(self) -> None:
         if self.chrome_live() and self.playing and self.playing.get("follow"):
@@ -3201,7 +3903,8 @@ class Finder:
         return state, ""
 
     def chrome_live(self) -> bool:
-        return bool(self.follow_chrome.get() and self.view and self.chrome_state()[0] is not None)
+        # A changed playback tempo cannot follow Songsterr, so Play then plays here instead.
+        return bool(self.follow_chrome.get() and self.view and abs(self.speed() - 1.0) < 0.001 and self.chrome_state()[0] is not None)
 
     def on_follow_toggle(self) -> None:
         if not self.follow_chrome.get() and self.playing and self.playing.get("follow"):
@@ -3275,6 +3978,11 @@ class Finder:
         if self.pending_pedal or (self.playing and self.playing.get("pedal")):
             self.show_chrome_text("Chrome: paused for the pedal rehearsal", hold=0.15)
             return
+        if abs(self.speed() - 1.0) >= 0.001:
+            self.show_chrome_text("Chrome: not following · press Reset on the BPM to play along", hold=0.25)
+            if following and not self.playing.get("paused"):
+                self.pause_playback()
+            return
         found = self.chrome_target(state)
         speed = int(state.get("speed") or 100)
         slow = f" · {speed}%" if speed != 100 else ""
@@ -3285,15 +3993,16 @@ class Finder:
             return
         target, tab_bar, midi_bar = found
         word = "playing" if state.get("playing") else "paused"
-        # Same width family of messages so the right-hand text does not dance.
-        self.show_chrome_text(f"Chrome: {word} · bar {tab_bar} → {midi_bar}{slow}", hold=0.12)
-        if not state.get("playing"):
+        if state.get("playing") and speed != 100:
+            # The preview always plays at full speed, so it cannot follow a slowed tab.
+            # Only one message per poll: two different ones would keep replacing each other.
+            self.show_chrome_text(f"Chrome: tab at {speed}% · set Songsterr to 100% to play along", hold=0.25)
             if following and not self.playing.get("paused"):
                 self.pause_playback()
             return
-        if speed != 100:
-            # The preview always plays at full speed, so it cannot follow a slowed tab.
-            self.show_chrome_text(f"Chrome: tab at {speed}% · set Songsterr to 100% to play along", hold=0.25)
+        # Same width family of messages so the right-hand text does not dance.
+        self.show_chrome_text(f"Chrome: {word} · bar {tab_bar} → {midi_bar}{slow}", hold=0.12)
+        if not state.get("playing"):
             if following and not self.playing.get("paused"):
                 self.pause_playback()
             return
@@ -3319,7 +4028,7 @@ class Finder:
         if not state or not self.view:
             return
         try:
-            play_at(target - state["file_start"])
+            play_at(self.audio_ms(target, state))
         except Exception as exc:
             self.stop()
             self.set_status(f"Playback failed: {exc}")
@@ -3440,6 +4149,7 @@ class Finder:
     def refresh_tab_panel(self, keep_info: bool = False) -> None:
         view = self.view
         tab = self.tab
+        self.update_roll()
         ready = view is not None and tab is not None
         has_sections = ready and bool(tab.sections)
         for widget in (self.shift_down, self.shift_up, self.shift_auto):
@@ -3451,6 +4161,11 @@ class Finder:
         self.match_tempo_button.configure(state="normal" if ready and tab.bars else "disabled")
         has_drums = ready and not self.busy and tab.best_part("drums") is not None
         self.tab_drums_button.configure(state="normal" if has_drums else "disabled")
+        can_add = (
+            ready and not self.busy and view["editable"]
+            and any(tab.best_part(SONGSTERR_KIND.get(kind, kind)) is not None for kind in keep_tracks.KINDS)
+        )
+        self.tab_parts_button.configure(state="normal" if can_add else "disabled")
         if not ready:
             self.shift_label["text"] = ""
             self.chart_shift_label["text"] = "Songsterr line-up"
@@ -3482,14 +4197,18 @@ class Finder:
             lines.append(f"It runs {abs(drift):.0f} s {'longer' if drift > 0 else 'shorter'} overall, so it drifts against the recording.")
         if half:
             lines.append("The MIDI is written in half time: two tab bars make one MIDI bar.")
-        if view["tab_sure"]:
-            lines.append("The drums line up well at this shift.")
-        else:
-            lines.append("The drum match is weak. Check the line-up by ear and use − or + to move it.")
+        if not view["tab_sure"]:
+            lines.append("The drum match is weak. Check the line-up by ear and use the ◀ ▶ arrows to move it.")
         if not tab.sections:
             lines.append("This tab has no section names, so the chart keeps the drum-based names.")
-        quality = "lines up well" if view["tab_sure"] else "weak match, check the line-up"
-        short = [f"Songsterr: {tab.count} bars", f"{bpm:g} BPM" if bpm else "", song_length(tab_ms), line, quality]
+        # The line-up itself is shown beside the ◀ ▶ arrows. "Lines up well" is not claimed here:
+        # the drum match can be a few bars off and still look good, so only a weak match is flagged.
+        short = [
+            f"Songsterr: {tab.count} bars",
+            f"{bpm:g} BPM" if bpm else "",
+            song_length(tab_ms),
+            "" if view["tab_sure"] else "weak drum match, check the line-up",
+        ]
         if half:
             short.append("half time")
         self.set_tab_info("  ·  ".join(part for part in short if part), " ".join(lines))
@@ -3558,6 +4277,83 @@ class Finder:
             "Use Save MIDI to keep it."
         )
 
+    def on_add_tab_parts(self) -> None:
+        """Put Songsterr's guitar, bass and vocal into this MIDI, on its bars, so Save MIDI keeps them."""
+        view, tab = self.view, self.tab
+        if not view or not tab or self.busy:
+            return
+        have = {track.kind for track in view["kept"]}
+        wanted = []
+        for kind in keep_tracks.KINDS:
+            part = tab.best_part(SONGSTERR_KIND.get(kind, kind))
+            if kind not in have and part is not None:
+                wanted.append((kind, part))
+        if not wanted:
+            self.set_status("Nothing to add. This MIDI already has the parts Songsterr has, or Songsterr has none of them.")
+            return
+        names = ", ".join(f"{kind} ({part.name})" for kind, part in wanted)
+        shift, half = view["tab_shift"], view["tab_half"]
+        if not messagebox.askyesno(
+            "Add Songsterr's parts",
+            f"Add Songsterr's {names} to this MIDI?\n\n"
+            f"They are placed on the MIDI's bars the way the line-up has them ({self.shift_label['text'] or 'check the line-up first'}). "
+            "The drums are not touched, and parts the MIDI already has are left alone.\n\n"
+            "Undo takes them out. Save MIDI writes them into the file.",
+            parent=self.root,
+        ):
+            return
+        key, ppq, bounds = view["key"], view["ppq"], list(view["bounds"])
+        taken = {track.channel for track in view["kept"]}
+        channels = {}
+        for kind, _part in wanted:
+            channel = next(number for number in range(16) if number != keep_tracks.DRUM_CHANNEL and number not in taken)
+            taken.add(channel)
+            channels[kind] = channel
+        self.set_busy(True)
+        self.refresh_tab_panel(keep_info=True)
+        self.set_status("Reading Songsterr's parts…")
+
+        def work() -> None:
+            built, failed = [], []
+            for kind, part in wanted:
+                try:
+                    notes = self.tab_part_notes(tab, part.index)
+                    track = keep_tracks.place_tab(notes, bounds, ppq, channels[kind], notes.program, kind, shift, half)
+                except Exception as exc:
+                    if not isinstance(exc, (OSError, ValueError, KeyError, TypeError, IndexError)):
+                        log_error(type(exc), exc, exc.__traceback__)
+                    track = None
+                if track is None:
+                    failed.append(kind)
+                else:
+                    built.append(track)
+            self.from_worker(lambda: self.finish_add_tab_parts(key, built, failed))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def finish_add_tab_parts(self, key: str, built: list, failed: list[str]) -> None:
+        self.set_busy(False)
+        view = self.view
+        if view is not None and self.tab is not None:
+            self.refresh_tab_panel(keep_info=True)
+        if view is None or view["key"] != key:
+            self.set_status("Songsterr's parts arrived after you changed songs. Open the song again and retry.")
+            return
+        problem = f" Could not add {', '.join(failed)}: read error or no notes on these bars." if failed else ""
+        if not built:
+            self.set_status("Nothing was added." + problem)
+            return
+        self.remember("add Songsterr parts")
+        view["kept"] = list(view["kept"]) + built
+        view["generation"] = view.get("generation", 1) + 1
+        self.tab_roll_keys.clear()
+        self.tab_roll_choices.clear()
+        self.update_roll()
+        self.refresh_tab_panel(keep_info=True)
+        self.set_status(
+            f"Added Songsterr's {keep_tracks.summary(built)} to this MIDI.{problem} Save MIDI writes them into the file. Undo takes them out."
+        )
+
     def on_use_tab_drums(self) -> None:
         view, tab = self.view, self.tab
         if not view or not tab or self.busy:
@@ -3569,7 +4365,13 @@ class Finder:
         if not messagebox.askyesno(
             "Use Songsterr's drums",
             f"Replace every note in this MIDI with Songsterr's {part.name} part?\n\n"
-            f"The song becomes the tab's {tab.count} bars (it has {len(view['hits'])} now), with the tab's meters and tempo, "
+            + (
+                "This MIDI's guitar, bass and vocal go too, since they would no longer sit on the bars. "
+                "Songsterr's come in their place.\n\n"
+                if view["kept"]
+                else ""
+            )
+            + f"The song becomes the tab's {tab.count} bars (it has {len(view['hits'])} now), with the tab's meters and tempo, "
             "and the ranges are set from its sections.\n\n"
             "Undo brings this MIDI's drums back. Save MIDI writes the result.",
             parent=self.root,
@@ -3584,13 +4386,24 @@ class Finder:
             try:
                 _meta, track = songsterr.drum_part(tab)
                 drums, error = songsterr.drums_to_midi(track, ppq), ""
-            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError, urllib.error.URLError) as exc:
-                drums, error = None, f"Songsterr's drum part could not be read ({exc})."
-            self.from_worker(lambda: self.finish_tab_drums(key, tab, drums, error))
+                kept = tab_kept(tab, drums, ppq)
+            except Exception as exc:
+                # Whatever goes wrong here, the finder must come back from "busy".
+                if not isinstance(exc, (OSError, ValueError, KeyError, TypeError)):
+                    log_error(type(exc), exc, exc.__traceback__)
+                drums, kept, error = None, [], f"Songsterr's drum part could not be read ({exc})."
+            self.from_worker(lambda: self.finish_tab_drums(key, tab, drums, error, kept))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def finish_tab_drums(self, key: str, tab: songsterr.Tab, drums: songsterr.TabDrums | None, error: str) -> None:
+    def finish_tab_drums(
+        self,
+        key: str,
+        tab: songsterr.Tab,
+        drums: songsterr.TabDrums | None,
+        error: str,
+        kept: list | None = None,
+    ) -> None:
         self.set_busy(False)
         view = self.view
         if view is not None and self.tab is not None:
@@ -3610,6 +4423,8 @@ class Finder:
         self.stop(drop_audio=True)
         self.pedal.reset()
         view["ticks"] = drums.ticks
+        # The MIDI's own guitar and bass would no longer sit on the bars, so Songsterr's take their place.
+        view["kept"] = list(kept or [])
         view["bounds"] = drums.bounds
         view["tempos"] = midi_export.clean_tempos(drums.tempos)
         view["meters"] = drums.meters
@@ -3642,6 +4457,8 @@ class Finder:
         if drums.dropped:
             changed.append(f"{sum(drums.dropped.values())} notes with no drum sound were left out")
         extra = (" " + ". ".join(changed) + ".") if changed else ""
+        if view["kept"]:
+            extra += f" Songsterr's {keep_tracks.summary(view['kept'])} came with it."
         self.edited(
             f"Switched to Songsterr's {drums.part_name}: {count} bars, {len(drums.ticks)} hits.{extra} "
             + " ".join(notes)
@@ -3739,6 +4556,7 @@ class Finder:
         self.use_tab_button = add(tab, "use_tab", "Use Songsterr sections", self.on_use_tab)
         self.match_tempo_button = add(tab, "match", "Match Songsterr tempo…", self.on_match_tempo)
         self.tab_drums_button = add(tab, "tab_drums", "Use Songsterr's drums for the whole song…", self.on_use_tab_drums)
+        self.tab_parts_button = add(tab, "tab_parts_add", "Add Songsterr's guitar, bass and vocal to this MIDI…", self.on_add_tab_parts)
         tab.add_separator()
         tab.add_checkbutton(label="Play along with Songsterr in Chrome", variable=self.follow_chrome, command=self.on_follow_toggle)
         add(tab, "chrome_setup", "Set up Chrome…", self.chrome_setup)
@@ -4099,6 +4917,11 @@ class Finder:
             self.pause_button.configure(text="Pause", state="normal")
         else:
             self.pause_button.configure(text="Pause", state="disabled")
+        # The button between the line-up arrows: Play when stopped or paused, Pause while playing.
+        playing_now = bool(self.playing) and not self.playing.get("paused")
+        self.chart_play.configure(text="Pause" if playing_now else "Play", state="normal" if self.view else "disabled")
+        self.refresh_speed(keep_text=self.root.focus_get() is self.bpm_entry)
+        self.update_roll()
         chosen = "normal" if self.selection and self.view else "disabled"
         if self.selection and self.view:
             start, end = self.selection
@@ -4122,6 +4945,7 @@ class Finder:
         self.preparing = False
         self.playing = None
         self.pending_start = None
+        self.pending_hold = False
         self.pending_follow = False
         self.pending_pedal = False
         self.cancel_tick()
@@ -4213,17 +5037,23 @@ class Finder:
         self.root.clipboard_append(text)
         self.set_status("Ranges copied.")
 
-    def export_data(self, mode: str) -> tuple[bytes, dict[str, list[int]], int]:
+    def export_data(self, mode: str, with_parts: bool = True) -> tuple[bytes, dict[str, list[int]], int]:
+        """The MIDI to save. The guitar, bass and vocal ride along as extra tracks unless with_parts is off."""
         view = self.view
         name = f"{view['artist']} - {view['title']} drums"
+        kept = view.get("kept") or []
         if mode == "parts":
+            ranges: list = []
             events, tempos, bounds, meters, divisions = midi_export.pedal_parts(
-                view["ticks"], view["tempos"], view["bounds"], view["meters"], view["divisions"]
+                view["ticks"], view["tempos"], view["bounds"], view["meters"], view["divisions"], ranges
             )
+            kept = keep_tracks.copy_ranges(kept, ranges)
         else:
             events, tempos, bounds, meters = view["ticks"], view["tempos"], view["bounds"], view["meters"]
             divisions = {key: list(span) for key, span in view["divisions"].items()}
-        data = midi_export.build(view["ppq"], events, tempos, bounds, meters, name)
+        data = midi_export.build(
+            view["ppq"], events, tempos, bounds, meters, name, extra=kept if with_parts else None
+        )
         return data, divisions, len(bounds) - 1
 
     def open_export(self) -> None:
@@ -4252,9 +5082,10 @@ class Finder:
         frame = ttk.Frame(dialog, padding=18)
         frame.pack(fill="both", expand=True)
         ttk.Label(frame, text="Save MIDI for the RC-10R", style="Song.TLabel").pack(anchor="w")
+        kept = view.get("kept") or []
         ttk.Label(
             frame,
-            text="This writes a type 0 drum MIDI with your edits (bars and timing). "
+            text="This writes the drums on channel 10 with your edits (bars and timing). "
             "Open it in Rhythm Converter and type the ranges below.",
             style="Muted.TLabel",
             wraplength=520,
@@ -4265,6 +5096,22 @@ class Finder:
         ttk.Radiobutton(
             frame, text="Only the pedal parts, back to back (a shorter file)", variable=mode, value="parts"
         ).pack(anchor="w", pady=(4, 0))
+        with_parts = tk.BooleanVar(master=dialog, value=True)
+        if kept:
+            names = ", ".join(track.name for track in kept)
+            ttk.Checkbutton(
+                frame,
+                text=f"Keep the {keep_tracks.summary(kept)} track{'s' if len(kept) > 1 else ''} for later",
+                variable=with_parts,
+            ).pack(anchor="w", pady=(10, 0))
+            ttk.Label(
+                frame,
+                text=f"{names}. They follow your bar edits and sit after the drums, which makes it a type 1 file. "
+                "Turn this off for a plain type 0 drum file.",
+                style="Muted.TLabel",
+                wraplength=520,
+                justify="left",
+            ).pack(anchor="w", padx=(22, 0))
         preview = ttk.Label(frame, text="", font=REPORT_FONT, justify="left")
         preview.pack(anchor="w", pady=(12, 0))
 
@@ -4286,7 +5133,7 @@ class Finder:
         replace_note.pack(anchor="w", pady=(4, 0))
 
         def refresh(*_args: object) -> None:
-            _data, divisions, bars = self.export_data(mode.get())
+            _data, divisions, bars = self.export_data(mode.get(), with_parts.get())
             preview["text"] = f"{bars} bars\n" + "\n".join(typing_lines(divisions))
             reason = ""
             if mode.get() == "parts":
@@ -4306,12 +5153,13 @@ class Finder:
 
         mode.trace_add("write", refresh)
         refresh()
+        self._export_vars = (mode, with_parts, keep)
         row = ttk.Frame(frame)
         row.pack(anchor="e", pady=(16, 0))
 
         def save() -> None:
             choice = mode.get()
-            data, divisions, _bars = self.export_data(choice)
+            data, divisions, _bars = self.export_data(choice, with_parts.get())
             final = self.output_folder()
             try:
                 final.mkdir(parents=True, exist_ok=True)
@@ -4323,7 +5171,10 @@ class Finder:
             if keep.get() == "replace":
                 if not messagebox.askyesno(
                     "Replace the original",
-                    f"Replace {source.name} with the edited drums?\n\nThe old file goes to the Recycle Bin, so you can still restore it.",
+                    f"Replace {source.name} with the edited drums"
+                    + (f" and the {keep_tracks.summary(kept)} parts" if kept and with_parts.get() else "")
+                    + "?\n\nThe old file goes to the Recycle Bin, so you can still restore it."
+                    + (f" The {keep_tracks.summary(kept)} in it are not in the new file." if kept and not with_parts.get() else ""),
                     parent=dialog,
                 ):
                     return

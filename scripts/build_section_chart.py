@@ -15,6 +15,9 @@ import shutil
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import keep_tracks  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 MAP_PATH = Path(os.environ.get("APPDATA") or ROOT) / "MidiTool" / "song-list.json"
 OLD_MAP_PATH = ROOT / "songs" / "ready.json"
@@ -130,6 +133,7 @@ def read_vlq(data: bytes, index: int) -> tuple[int, int]:
 
 def parse_track(
     data: bytes,
+    offs: list[tuple[int, int, int]] | None = None,
 ) -> tuple[
     list[tuple[int, int, int, int]],
     list[tuple[int, int]],
@@ -215,6 +219,8 @@ def parse_track(
                 index += 2
                 if kind == 0x90 and velocity > 0:
                     notes.append((tick, status & 0x0F, note, velocity))
+                elif offs is not None and kind in (0x80, 0x90):
+                    offs.append((tick, status & 0x0F, note))
             else:
                 raise ValueError(f"unsupported status {status:#x} at tick {tick}")
 
@@ -231,6 +237,8 @@ def parse_midi(path: Path) -> dict:
     if division & 0x8000:
         raise ValueError(f"{path.name} uses SMPTE timing, which this chart does not read")
     ppq = division
+    if ppq <= 0:
+        raise ValueError(f"{path.name} has no timing information (ticks per beat is 0)")
 
     position = 8 + header_len
     tracks = []
@@ -243,11 +251,18 @@ def parse_midi(path: Path) -> dict:
         length = int.from_bytes(data[position + 4 : position + 8], "big")
         track = data[position + 8 : position + 8 + length]
         position += 8 + length
-        track_notes, track_tempos, track_sigs, track_end, track_name, track_programs, track_instruments = parse_track(track)
+        track_offs: list[tuple[int, int, int]] = []
+        try:
+            track_notes, track_tempos, track_sigs, track_end, track_name, track_programs, track_instruments = parse_track(
+                track, track_offs
+            )
+        except IndexError:
+            raise ValueError(f"{path.name} is damaged: a track ends in the middle of a message") from None
         tracks.append(
             {
                 "name": track_name,
                 "notes": track_notes,
+                "offs": track_offs,
                 "programs": track_programs,
                 "instruments": track_instruments,
             }
@@ -281,6 +296,7 @@ def parse_midi(path: Path) -> dict:
         "signatures": signatures,
         "end_tick": end_tick,
         "tracks": track_summaries,
+        "kept": keep_tracks.collect(tracks, ppq),
     }
 
 
